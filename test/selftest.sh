@@ -80,40 +80,76 @@ run_case() {  # $1=label  $2..=cannelloni args ; CANENV provides shim env
   "$CANNBIN" "$@" >/dev/null 2>&1 & local CNPID=$!; PIDS+=("$CNPID")
   sleep 1.0
 
-  ( cd "$BUILD" && eval "$CANENV" wine ./canshim_probe.exe 0x18EEFF00 ext DE AD BE EF ) \
+  # PROBE_ARGS, INJECT, TXGREP, RXGREP are set by the caller per scenario.
+  ( cd "$BUILD" && eval "$CANENV" wine ./canshim_probe.exe $PROBE_ARGS ) \
       > "$probe_out" 2>/dev/null & local PBPID=$!; PIDS+=("$PBPID")
 
   sleep 2.0
-  cansend "$VCAN" 18FF0102#01020304 2>/dev/null
-  echo "  injected: cansend $VCAN 18FF0102#01020304"
+  cansend "$VCAN" "$INJECT" 2>/dev/null
+  echo "  injected: cansend $VCAN $INJECT"
 
   wait "$PBPID" 2>/dev/null
   sleep 0.4
   kill "$CNPID" "$CDPID" 2>/dev/null
+  sleep 0.8   # let sockets release before the next case rebinds
 
-  if grep -qiE "18EEFF00#?.*DEADBEEF|18EEFF00#DEADBEEF" "$cap"; then
-    echo "  PASS: probe TX (0x18EEFF00 DEADBEEF) seen on $VCAN"
+  if grep -qiE "$TXGREP" "$cap"; then
+    echo "  PASS: probe TX seen on $VCAN ($TXGREP)"
   else
-    echo "  FAIL: probe TX not seen on $VCAN"; echo "  --- candump ---"; sed 's/^/    /' "$cap"
+    echo "  FAIL: probe TX not seen on $VCAN ($TXGREP)"; echo "  --- candump ---"; sed 's/^/    /' "$cap"
     echo "  --- probe ---"; sed 's/^/    /' "$probe_out"; FAIL=1
   fi
-  if grep -qiE "RX id=0x18FF0102" "$probe_out"; then
-    echo "  PASS: injected frame delivered to probe canRead"
+  if grep -qiE "$RXGREP" "$probe_out"; then
+    echo "  PASS: injected frame delivered to probe canRead ($RXGREP)"
   else
-    echo "  FAIL: probe did not receive injected frame"; echo "  --- probe ---"; sed 's/^/    /' "$probe_out"; FAIL=1
+    echo "  FAIL: probe did not receive injected frame ($RXGREP)"; echo "  --- probe ---"; sed 's/^/    /' "$probe_out"; FAIL=1
   fi
   rm -f "$cap" "$probe_out"
 }
 
+# --- classic CAN, extended ID, over both transports ---
+PROBE_ARGS="0x18EEFF00 ext DE AD BE EF"
+INJECT="18FF0102#01020304"
+TXGREP="18EEFF00#?.*DEADBEEF|18EEFF00#DEADBEEF"
+RXGREP="RX id=0x18FF0102"
+
 # UDP: cannelloni listens 20100, sends to probe at 20101
 CANENV="CANSHIM_PROTO=udp CANSHIM_HOST=127.0.0.1 CANSHIM_PORT=20100 CANSHIM_LOCALPORT=20101" \
-  run_case "UDP" -I "$VCAN" -R 127.0.0.1 -r 20101 -l 20100
+  run_case "UDP (classic)" -I "$VCAN" -R 127.0.0.1 -r 20101 -l 20100
 
 # TCP: cannelloni is server on 20102, shim connects as client.
 # -p disables cannelloni's peer-IP check (else it rejects our client's source IP
 # since no -R is set on a server). On a real deployment, set -R <win-ip> instead.
 CANENV="CANSHIM_PROTO=tcp CANSHIM_TCPROLE=client CANSHIM_HOST=127.0.0.1 CANSHIM_PORT=20102" \
-  run_case "TCP" -C s -p -I "$VCAN" -l 20102
+  run_case "TCP (classic)" -C s -p -I "$VCAN" -l 20102
+
+# --- CAN FD with bit-rate switch (over UDP) ---
+# probe sends 12 FD bytes with BRS; candump -L marks FD frames with '##'.
+PROBE_ARGS="0x18EEFF02 extfdbrs 00 11 22 33 44 55 66 77 88 99 AA BB"
+INJECT="18FF0105##100112233445566778899AABBCCDDEEFF"   # ## => FD, flags nibble 1 = BRS
+TXGREP="18EEFF02##.*001122334455"
+# flag >= 0x10000 (5 hex digits, nonzero lead) => an FD flag bit is set (FDF/BRS/ESI)
+RXGREP="RX id=0x18FF0105 .*flag=0x[1-9a-fA-F][0-9a-fA-F]{4}"
+
+CANENV="CANSHIM_PROTO=udp CANSHIM_HOST=127.0.0.1 CANSHIM_PORT=20104 CANSHIM_LOCALPORT=20105" \
+  run_case "UDP (CAN FD + BRS)" -I "$VCAN" -R 127.0.0.1 -r 20105 -l 20104
+
+# --- INI-based config (Windows-native): no CANSHIM_* config env at all ---
+# The shim must auto-discover kvasilloni.ini next to the DLL (ports 20106/20107).
+cat > "$BUILD/kvasilloni.ini" <<EOF
+[cannelloni]
+host      = 127.0.0.1
+port      = 20106
+localport = 20107
+proto     = udp
+EOF
+PROBE_ARGS="0x18EEFF03 ext CA FE"
+INJECT="18FF0106#05060708"
+TXGREP="18EEFF03#?.*CAFE"
+RXGREP="RX id=0x18FF0106"
+CANENV="" \
+  run_case "UDP (INI config, no env)" -I "$VCAN" -R 127.0.0.1 -r 20107 -l 20106
+rm -f "$BUILD/kvasilloni.ini"
 
 echo
 if [ "$FAIL" = 0 ]; then echo "SELFTEST: PASS"; else echo "SELFTEST: FAIL"; fi

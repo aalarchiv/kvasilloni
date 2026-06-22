@@ -1,0 +1,29 @@
+; kvasilloni.ini — configuration for the canlib32.dll cannelloni shim.
+;
+; Copy this file to "kvasilloni.ini" and place it next to canlib32.dll (or next
+; to your application's .exe). Values here are overridden by CANSHIM_* environment
+; variables if those are set, so scripted/CI runs can still override the file.
+;
+; The [cannelloni] section header is optional.
+
+[cannelloni]
+
+; IP address of the Linux host running cannelloni.
+host = 192.168.1.50
+
+; Remote port the shim sends to (cannelloni's listen port, its -l).
+port = 20000
+
+; Local port the shim binds (UDP) or listens on (TCP server).
+; For UDP this is cannelloni's -r remote port.
+localport = 20000
+
+; Transport: udp (default, simplest) or tcp (reliable, ordered).
+proto = udp
+
+; TCP only: client (shim dials cannelloni -C s) or server (shim accepts
+; cannelloni -C c). Ignored for udp.
+tcprole = client
+
+; Optional debug log. Leave empty/omit to disable.
+; log = C:\temp\kvasilloni.log

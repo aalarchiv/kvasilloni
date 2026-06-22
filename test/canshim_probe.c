@@ -17,6 +17,9 @@
 
 #define canMSG_STD 0x0002
 #define canMSG_EXT 0x0004
+#define canFDMSG_FDF 0x010000
+#define canFDMSG_BRS 0x020000
+#define canFDMSG_ESI 0x040000
 #define canERR_NOMSG (-2)
 
 typedef void (__stdcall *fn_init)(void);
@@ -39,10 +42,16 @@ int main(int argc, char **argv)
     fn_close p_close;
     int h, st, i, loops;
     long id = (argc > 1) ? strtol(argv[1], NULL, 0) : 0x123;
-    unsigned flag = (argc > 2 && argv[2][0] == 'e') ? canMSG_EXT : canMSG_STD;
-    unsigned char data[8]; unsigned dlc = 0;
-
-    for (i = 3; i < argc && dlc < 8; i++) data[dlc++] = (unsigned char)strtol(argv[i], NULL, 16);
+    /* argv[2] is a flag spec: any of ext/std/fd/brs as substrings, e.g. "extfdbrs" */
+    const char *spec = (argc > 2) ? argv[2] : "std";
+    unsigned flag = strstr(spec, "ext") ? canMSG_EXT : canMSG_STD;
+    unsigned is_fd = strstr(spec, "fd") ? 1 : 0;
+    unsigned char data[64]; unsigned dlc = 0;
+    if (is_fd) {
+        flag |= canFDMSG_FDF;
+        if (strstr(spec, "brs")) flag |= canFDMSG_BRS;
+    }
+    for (i = 3; i < argc && dlc < 64; i++) data[dlc++] = (unsigned char)strtol(argv[i], NULL, 16);
 
     dll = LoadLibraryA("canlib32.dll");
     if (!dll) { fprintf(stderr, "PROBE: LoadLibrary failed %lu\n", GetLastError()); return 2; }

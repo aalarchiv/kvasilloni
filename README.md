@@ -32,8 +32,9 @@ canWrite              canRead          canReadStatus    canReadErrorCounters
 canGetBusStatistics  canGetErrorText  canGetVersion    canClose
 ```
 
-Classic CAN frames (11-bit and 29-bit IDs, DLC 0–8, RTR) are fully supported.
-CAN-FD is decoded if received but not yet wired through `canWrite` (follow-up).
+Classic CAN frames (11-bit and 29-bit IDs, DLC 0–8, RTR) and **CAN FD**
+(`canFDMSG_FDF`/`BRS`/`ESI`, payloads up to 64 bytes, DLC auto-rounded to a valid
+FD length) are supported in both directions.
 
 ## Build
 
@@ -56,21 +57,40 @@ matches your Windows application's bitness (most legacy Kvaser apps are 32-bit).
 1. Drop the matching `canlib32.dll` **next to the application's executable**
    (Windows resolves `LoadLibrary("canlib32.dll")` from the app directory first;
    back up the genuine Kvaser DLL if one is present).
-2. Configure the shim via environment variables (see below) pointing at the Linux
-   host.
+2. Copy `kvasilloni.ini.example` to **`kvasilloni.ini`**, edit it to point at the
+   Linux host, and place it next to the DLL (or next to the .exe).
 3. Start the app and select **Interface Type = Kvaser** (or however it opens a
    Kvaser channel).
 
-### Configuration (environment variables)
+### Configuration
 
-| Variable            | Default       | Meaning                                        |
-|---------------------|---------------|------------------------------------------------|
-| `CANSHIM_HOST`      | `127.0.0.1`   | Linux host running cannelloni                   |
-| `CANSHIM_PORT`      | `20000`       | Remote port the shim sends to                   |
-| `CANSHIM_LOCALPORT` | `20000`       | Local UDP bind / TCP server port                |
-| `CANSHIM_PROTO`     | `udp`         | `udp` or `tcp`                                  |
-| `CANSHIM_TCPROLE`   | `client`      | `client` or `server` (TCP only)                 |
-| `CANSHIM_LOG`       | (unset)       | If set, append a debug log to this path         |
+The shim is configured by an **INI file** — the Windows-native mechanism. It looks
+for `kvasilloni.ini` next to the DLL, then next to the application's .exe
+(`CANSHIM_INI` may give an explicit path). See `kvasilloni.ini.example`:
+
+```ini
+[cannelloni]
+host      = 192.168.1.50   ; Linux host running cannelloni
+port      = 20000          ; remote port the shim sends to (cannelloni's -l)
+localport = 20000          ; local UDP bind / TCP server port (cannelloni's -r)
+proto     = udp            ; udp | tcp
+tcprole   = client         ; client | server  (tcp only)
+; log     = C:\temp\kvasilloni.log
+```
+
+Every setting can also be overridden by an **environment variable**, which takes
+precedence over the INI (handy for scripting/CI). Precedence is
+**defaults → INI → environment**.
+
+| Variable            | INI key     | Default     | Meaning                              |
+|---------------------|-------------|-------------|--------------------------------------|
+| `CANSHIM_HOST`      | `host`      | `127.0.0.1` | Linux host running cannelloni        |
+| `CANSHIM_PORT`      | `port`      | `20000`     | Remote port the shim sends to        |
+| `CANSHIM_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port     |
+| `CANSHIM_PROTO`     | `proto`     | `udp`       | `udp` or `tcp`                       |
+| `CANSHIM_TCPROLE`   | `tcprole`   | `client`    | `client` or `server` (TCP only)      |
+| `CANSHIM_LOG`       | `log`       | (unset)     | If set, append a debug log here      |
+| `CANSHIM_INI`       | —           | (auto)      | Explicit path to the INI file        |
 
 ## Linux side (cannelloni)
 
@@ -131,6 +151,8 @@ make selftest
 - **`src/transport.rs`** — UDP and TCP (client/server) transports with a
   background RX thread feeding a bounded ring; `canWrite` sends one frame,
   `canRead` drains the ring (`canERR_NOMSG` when empty).
+- **`src/config.rs`** — layered config (defaults → `kvasilloni.ini` → env). Finds
+  the INI next to the DLL or the .exe via `GetModuleFileNameW`.
 - **`src/lib.rs`** — the 13 `extern "system"` exports. Each wraps its body in
   `catch_unwind` so a stray panic becomes a CANlib error code, never an unwind
   across the FFI boundary.

@@ -16,6 +16,7 @@
 //!   CANSHIM_TCPROLE   "client" | "server"        (default "client")
 //!   CANSHIM_LOG       path; if set, append a debug log
 
+mod config;
 mod transport;
 mod wire;
 
@@ -24,7 +25,8 @@ use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_ushort};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
-use transport::{Conn, Config};
+use config::Config;
+use transport::Conn;
 use wire::Frame;
 
 // ---- CANlib return codes (refs/kvaser_canlib/canstat.h) ----
@@ -35,9 +37,14 @@ const CAN_ERR_NOTFOUND: c_int = -3;
 
 /// Single channel; the target app opens exactly one.
 static CONN: Mutex<Option<Conn>> = Mutex::new(None);
+/// Log path resolved from config at canOpenChannel (env `CANSHIM_LOG` still wins).
+static LOG_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 fn log(msg: &str) {
-    if let Ok(path) = std::env::var("CANSHIM_LOG") {
+    let path = std::env::var("CANSHIM_LOG")
+        .ok()
+        .or_else(|| LOG_PATH.lock().ok().and_then(|g| g.clone()));
+    if let Some(path) = path {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{msg}");
@@ -61,8 +68,18 @@ pub extern "system" fn canInitializeLibrary() {
 #[no_mangle]
 pub extern "system" fn canOpenChannel(channel: c_int, flags: c_int) -> c_int {
     guard(|| {
-        log(&format!("canOpenChannel(ch={channel}, flags={flags:#x})"));
-        let cfg = Config::from_env();
+        let cfg = Config::load();
+        if let Ok(mut g) = LOG_PATH.lock() {
+            *g = cfg.log.clone();
+        }
+        log(&format!(
+            "canOpenChannel(ch={channel}, flags={flags:#x}) proto={} host={}:{} local={} role={}",
+            if cfg.tcp { "tcp" } else { "udp" },
+            cfg.host,
+            cfg.remote_port,
+            cfg.local_port,
+            if cfg.tcp_server { "server" } else { "client" },
+        ));
         match Conn::connect(&cfg) {
             Ok(c) => {
                 *CONN.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
@@ -113,10 +130,22 @@ pub extern "system" fn canWrite(
     guard(|| {
         let mut f = Frame::default();
         f.can_id = wire::kvaser_to_canid(id as i32, flag as u32);
-        f.len = dlc.min(8) as u8; // classic CAN
-        if !msg.is_null() && f.len > 0 && flag & wire::CAN_MSG_RTR == 0 {
-            let src = unsafe { std::slice::from_raw_parts(msg as *const u8, f.len as usize) };
-            f.data[..f.len as usize].copy_from_slice(src);
+
+        // How many data bytes the caller actually supplied, and the on-wire len.
+        // CAN FD: up to 64 bytes, len rounded up to a valid FD DLC (pad with 0).
+        // Classic CAN: up to 8 bytes.
+        let user_bytes = if flag & wire::CAN_MSG_FDF != 0 {
+            f.fd = true;
+            f.fd_flags = wire::kvaser_to_fd_flags(flag as u32);
+            f.len = wire::fd_round_len(dlc.min(64) as u8);
+            dlc.min(64) as usize
+        } else {
+            f.len = dlc.min(8) as u8;
+            f.len as usize
+        };
+        if !msg.is_null() && user_bytes > 0 && flag & wire::CAN_MSG_RTR == 0 {
+            let src = unsafe { std::slice::from_raw_parts(msg as *const u8, user_bytes) };
+            f.data[..user_bytes].copy_from_slice(src);
         }
         let guard = CONN.lock().unwrap_or_else(|e| e.into_inner());
         let r = match guard.as_ref() {
@@ -157,7 +186,10 @@ pub extern "system" fn canRead(
             Some(f) => f,
             None => return CAN_ERR_NOMSG,
         };
-        let (oid, oflag) = wire::canid_to_kvaser(f.can_id, f.fd);
+        let (oid, mut oflag) = wire::canid_to_kvaser(f.can_id, f.fd);
+        if f.fd {
+            oflag |= wire::fd_flags_to_kvaser(f.fd_flags); // BRS/ESI
+        }
         unsafe {
             if !id.is_null() {
                 *id = oid as c_long;

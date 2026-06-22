@@ -21,11 +21,56 @@ pub const CAN_RTR_FLAG: u32 = 0x4000_0000;
 pub const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
 pub const CAN_SFF_MASK: u32 = 0x0000_07FF;
 
-// ---- Kvaser canMSG_* flags (refs/kvaser_canlib/.../canlib.h) ----
+// ---- Kvaser canMSG_* / canFDMSG_* flags (refs/pycanlib enums.py MessageFlag) ----
 pub const CAN_MSG_RTR: u32 = 0x0001;
 pub const CAN_MSG_STD: u32 = 0x0002;
 pub const CAN_MSG_EXT: u32 = 0x0004;
-pub const CAN_MSG_FDF: u32 = 0x0001_0000;
+pub const CAN_MSG_FDF: u32 = 0x0001_0000; // CAN FD frame
+pub const CAN_MSG_BRS: u32 = 0x0002_0000; // CAN FD bit-rate switch
+pub const CAN_MSG_ESI: u32 = 0x0004_0000; // CAN FD error state indicator
+
+// ---- SocketCAN canfd_frame.flags bits (linux/can.h), carried in fd_flags ----
+pub const CANFD_BRS: u8 = 0x01;
+pub const CANFD_ESI: u8 = 0x02;
+
+/// Round a byte count up to a valid CAN FD data length
+/// (0..8, 12, 16, 20, 24, 32, 48, 64). cannelloni/SocketCAN require a valid DLC.
+pub fn fd_round_len(n: u8) -> u8 {
+    match n {
+        0..=8 => n,
+        9..=12 => 12,
+        13..=16 => 16,
+        17..=20 => 20,
+        21..=24 => 24,
+        25..=32 => 32,
+        33..=48 => 48,
+        _ => 64,
+    }
+}
+
+/// Map Kvaser canFDMSG_* flags to the cannelloni/SocketCAN `fd_flags` byte.
+pub fn kvaser_to_fd_flags(kvaser_flag: u32) -> u8 {
+    let mut f = 0;
+    if kvaser_flag & CAN_MSG_BRS != 0 {
+        f |= CANFD_BRS;
+    }
+    if kvaser_flag & CAN_MSG_ESI != 0 {
+        f |= CANFD_ESI;
+    }
+    f
+}
+
+/// Map a cannelloni/SocketCAN `fd_flags` byte to Kvaser canFDMSG_* flags.
+pub fn fd_flags_to_kvaser(fd_flags: u8) -> u32 {
+    let mut f = 0;
+    if fd_flags & CANFD_BRS != 0 {
+        f |= CAN_MSG_BRS;
+    }
+    if fd_flags & CANFD_ESI != 0 {
+        f |= CAN_MSG_ESI;
+    }
+    f
+}
 
 /// A decoded CAN frame in SocketCAN terms (`can_id` carries the flag bits).
 #[derive(Clone, Copy, Debug)]
@@ -333,6 +378,64 @@ mod tests {
             assert_eq!(got.len, c.len);
             assert_eq!(&got.data[..c.len as usize], &c.data[..c.len as usize]);
         }
+    }
+
+    #[test]
+    fn fd_round_len_valid_dlcs() {
+        assert_eq!(fd_round_len(0), 0);
+        assert_eq!(fd_round_len(8), 8);
+        assert_eq!(fd_round_len(9), 12);
+        assert_eq!(fd_round_len(13), 16);
+        assert_eq!(fd_round_len(33), 48);
+        assert_eq!(fd_round_len(64), 64);
+        assert_eq!(fd_round_len(200), 64);
+    }
+
+    #[test]
+    fn golden_udp_fd() {
+        // FD STD id=0x200, BRS, 12 data bytes 00..0B, seq=0:
+        // header 02 00 00 00 01 | id 00 00 02 00 | len 0x8C (12|FD) | flags 01 | data
+        let mut f = Frame::default();
+        f.can_id = 0x200;
+        f.fd = true;
+        f.fd_flags = CANFD_BRS;
+        f.len = 12;
+        for i in 0..12 {
+            f.data[i] = i as u8;
+        }
+        let pkt = build_udp(&f, 0);
+        let mut expect = vec![0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x8C, 0x01];
+        expect.extend_from_slice(&(0u8..12).collect::<Vec<u8>>());
+        assert_eq!(pkt, expect);
+
+        // and it round-trips back through both decoders
+        let got = parse_udp(&pkt).expect("parse")[0];
+        assert!(got.fd && got.fd_flags == CANFD_BRS && got.len == 12);
+        assert_eq!(&got.data[..12], &expect[11..23]);
+    }
+
+    #[test]
+    fn fd_stream_roundtrip_with_flags() {
+        let mut f = Frame::default();
+        f.can_id = 0x1ABCDEF8 | CAN_EFF_FLAG;
+        f.fd = true;
+        f.fd_flags = CANFD_BRS | CANFD_ESI;
+        f.len = 16;
+        for i in 0..16 {
+            f.data[i] = (0xA0 + i) as u8;
+        }
+        let got = stream_roundtrip(&f);
+        assert!(got.fd);
+        assert_eq!(got.fd_flags, CANFD_BRS | CANFD_ESI);
+        assert_eq!(got.len, 16);
+        assert_eq!(&got.data[..16], &f.data[..16]);
+    }
+
+    #[test]
+    fn fd_flag_translation() {
+        assert_eq!(kvaser_to_fd_flags(CAN_MSG_BRS | CAN_MSG_ESI), CANFD_BRS | CANFD_ESI);
+        assert_eq!(fd_flags_to_kvaser(CANFD_BRS), CAN_MSG_BRS);
+        assert_eq!(fd_flags_to_kvaser(CANFD_ESI), CAN_MSG_ESI);
     }
 
     #[test]

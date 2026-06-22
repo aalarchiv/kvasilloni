@@ -12,34 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::config::Config;
 use crate::wire::{self, DecodeState, Decoded, Frame};
 
 const RING_CAP: usize = 8192;
-
-#[derive(Clone)]
-pub struct Config {
-    pub host: String,
-    pub remote_port: u16,
-    pub local_port: u16,
-    pub tcp: bool,
-    pub tcp_server: bool,
-}
-
-impl Config {
-    pub fn from_env() -> Config {
-        let env = |k: &str| std::env::var(k).ok();
-        let port = |k: &str, d: u16| env(k).and_then(|v| v.parse().ok()).unwrap_or(d);
-        let proto = env("CANSHIM_PROTO").unwrap_or_default();
-        let role = env("CANSHIM_TCPROLE").unwrap_or_default();
-        Config {
-            host: env("CANSHIM_HOST").unwrap_or_else(|| "127.0.0.1".into()),
-            remote_port: port("CANSHIM_PORT", 20000),
-            local_port: port("CANSHIM_LOCALPORT", 20000),
-            tcp: matches!(proto.as_bytes().first(), Some(b't') | Some(b'T')),
-            tcp_server: matches!(role.as_bytes().first(), Some(b's') | Some(b'S')),
-        }
-    }
-}
 
 enum Tx {
     Udp { sock: UdpSocket, remote: SocketAddr, seq: u8 },
