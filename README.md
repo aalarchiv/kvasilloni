@@ -61,14 +61,15 @@ your-can-app.exe
 
 ```bash
 # === VERIFY (dev host; needs wine, can-utils, cmake) ===
-make verify                # 13 exports present + undecorated
-make test                  # wire-codec unit tests
-make selftest              # full loopback over vcan1: classic UDP/TCP, CAN FD, INI
+make verify                # all exports present + undecorated
+make test                  # wire-codec + ring/notify/export unit tests
+make selftest              # full loopback over vcan1: classic UDP/TCP, CAN FD, INI,
+                           #   enumeration, acceptance filtering, notify callbacks
 ```
 
 ## Scope
 
-The shim implements exactly the **13 CANlib functions** the target application
+The shim implements the **13 core CANlib functions** the target application
 resolves (matching the reference DLL's export table):
 
 ```
@@ -81,6 +82,30 @@ Classic CAN frames (11-bit and 29-bit IDs, DLC 0–8, RTR) and **CAN FD**
 (`canFDMSG_FDF`/`BRS`/`ESI`, payloads up to 64 bytes, DLC auto-rounded to a valid
 FD length) are supported in both directions.
 
+### Extended exports (for retargeting to other apps)
+
+A further set of CANlib functions is implemented so the shim can stand in for
+apps with a wider import table (run the coverage check in `AGENTS.md` before
+targeting a new app):
+
+| Function(s) | Behavior |
+|---|---|
+| `canFlushReceiveQueue` / `canFlushTransmitQueue` | clears the RX ring / no-op (TX is synchronous) |
+| `canSetBusOutputControl` / `canGetBusOutputControl` | stores & returns the driver type (default `canDRIVER_NORMAL`) |
+| `canReadWait` / `canReadSync` | blocking read / wait-for-available, honoring the ms timeout (`canWAIT_INFINITE` ≈ unbounded) |
+| `canWriteWait` / `canWriteSync` | send synchronously, ignoring the timeout |
+| `canIoCtl` | dispatches `canIOCTL_FLUSH_RX/TX_BUFFER`, `GET/SET_TIMER_SCALE`, `SET_TXACK/TXRQ`, `GET_RX/TX_BUFFER_LEVEL`; unknown funcs return `canERR_NOT_IMPLEMENTED` |
+| `canAccept` | real acceptance filtering: drops frames where `(id & mask) != (code & mask)` (separate STD/EXT code+mask; zero mask = accept all) |
+| `canObjBufSetFilter` | benign no-op (object buffers are a distinct mechanism) |
+| `canGetNumberOfChannels` | returns the configured channel count (`KVASILLONI_CHANNELS` / ini `channels`, default 1) |
+| `canGetChannelData` | synthetic values for `CHANNEL_NAME` ("kvasilloni vcan*N*"), `DEVDESCR_ASCII`, `MFGNAME_ASCII`, `CARD_SERIAL_NO`, `CHANNEL_CAP/FLAGS`, `CARD_TYPE/NUMBER`, `CHAN_NO_ON_CARD` |
+| `canSetNotify` | event-driven RX callbacks (`canNOTIFY_RX`) |
+
+**`canSetNotify` threading caveat:** the registered callback is invoked **on the
+shim's RX thread**, not the thread that called `canSetNotify`. Keep it short and
+non-blocking, and ensure the function pointer stays valid until you disarm it
+(`canSetNotify(h, NULL, …)`) or `canClose`. Only `canNOTIFY_RX` is delivered.
+
 ## Build
 
 Requires the Rust toolchain plus the mingw-w64 linkers
@@ -90,7 +115,7 @@ Requires the Rust toolchain plus the mingw-w64 linkers
 rustup target add i686-pc-windows-gnu x86_64-pc-windows-gnu
 
 make            # -> target/{i686,x86_64}-pc-windows-gnu/release/canlib32.dll
-make verify     # confirm all 13 exports are present and undecorated (32-bit)
+make verify     # confirm all exports are present and undecorated (32-bit)
 make test       # host unit tests for the wire codec (golden vectors + round-trips)
 ```
 
@@ -201,9 +226,9 @@ make selftest
   `canRead` drains the ring (`canERR_NOMSG` when empty).
 - **`src/config.rs`** — layered config (defaults → `kvasilloni.ini` → env). Finds
   the INI next to the DLL or the .exe via `GetModuleFileNameW`.
-- **`src/lib.rs`** — the 13 `extern "system"` exports. Each wraps its body in
-  `catch_unwind` so a stray panic becomes a CANlib error code, never an unwind
-  across the FFI boundary.
+- **`src/lib.rs`** — the `extern "system"` exports (13 core + the extended
+  retargeting set). Each wraps its body in `catch_unwind` so a stray panic
+  becomes a CANlib error code, never an unwind across the FFI boundary.
 
 ### Wire format (cannelloni, for reference)
 

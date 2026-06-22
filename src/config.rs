@@ -13,6 +13,7 @@
 //! proto     = udp        ; udp | tcp
 //! tcprole   = client     ; client | server  (tcp only)
 //! log       = C:\temp\kvasilloni.log
+//! channels  = 1          ; advertised by canGetNumberOfChannels (retargeting)
 //! ```
 
 use std::collections::HashMap;
@@ -26,6 +27,8 @@ pub struct Config {
     pub tcp: bool,
     pub tcp_server: bool,
     pub log: Option<String>,
+    /// Number of channels advertised by `canGetNumberOfChannels` (retargeting).
+    pub channels: u32,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             tcp: false,
             tcp_server: false,
             log: None,
+            channels: 1,
         }
     }
 }
@@ -73,6 +77,9 @@ impl Config {
                 self.log = Some(v.clone());
             }
         }
+        if let Some(v) = m.get("channels").and_then(|v| v.parse().ok()) {
+            self.channels = v;
+        }
     }
 
     fn apply_env(&mut self) {
@@ -96,6 +103,9 @@ impl Config {
             if !v.is_empty() {
                 self.log = Some(v);
             }
+        }
+        if let Some(v) = e("KVASILLONI_CHANNELS").and_then(|v| v.parse().ok()) {
+            self.channels = v;
         }
     }
 }

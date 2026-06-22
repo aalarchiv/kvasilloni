@@ -5,10 +5,12 @@
 //! frame and sends it (one-frame UDP datagram, or a headerless TCP stream write).
 
 use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::raw::{c_int, c_long, c_ulong};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -17,6 +19,161 @@ use crate::wire::{self, DecodeState, Decoded, Frame};
 
 const RING_CAP: usize = 8192;
 
+/// `canSetNotify` flag: notify on receive (canstat.h canNOTIFY_RX).
+pub const NOTIFY_RX: u32 = 0x0001;
+/// Event code passed to the notify callback for a received frame (canstat.h).
+const EVENT_RX: c_int = 32000; // canEVENT_RX
+
+/// Mirrors the RX-relevant prefix of Kvaser's `canNotifyData` (canlib.h). For a
+/// receive event the C app reads `info.rx.id` / `info.rx.time`, which sit at the
+/// same offsets as `id` / `time` here (the union's first member). Layout matches
+/// the 32-bit target: pointer/long/ulong are all 4 bytes.
+#[repr(C)]
+struct NotifyData {
+    tag: *mut c_void,
+    event_type: c_int,
+    id: c_long,
+    time: c_ulong,
+}
+
+/// Acceptance filter state (set via `canAccept`). A frame passes when
+/// `(id & mask) == (code & mask)` for its id class; a zero mask accepts all,
+/// which is the default so filtering is opt-in.
+#[derive(Clone, Copy, Default)]
+struct Accept {
+    code_std: u32,
+    mask_std: u32,
+    code_ext: u32,
+    mask_ext: u32,
+}
+
+impl Accept {
+    fn accepts(&self, f: &Frame) -> bool {
+        let ext = f.can_id & wire::CAN_EFF_FLAG != 0;
+        let (id, code, mask) = if ext {
+            (f.can_id & wire::CAN_EFF_MASK, self.code_ext, self.mask_ext)
+        } else {
+            (f.can_id & wire::CAN_SFF_MASK, self.code_std, self.mask_std)
+        };
+        (id & mask) == (code & mask)
+    }
+}
+
+/// Registered notify callback. Stored as a `usize` so the struct stays `Send`;
+/// the C function pointer is transmuted back only on the RX thread that calls it.
+#[derive(Clone, Copy, Default)]
+struct Notify {
+    cb: usize,
+    flags: u32,
+    tag: usize,
+}
+
+/// State shared between the RX thread (producer) and the API (consumer): the
+/// bounded ring plus a condvar for blocking reads, acceptance filters, and the
+/// optional notify callback.
+pub struct Shared {
+    q: Mutex<VecDeque<Frame>>,
+    cv: Condvar,
+    filters: Mutex<Accept>,
+    notify: Mutex<Notify>,
+}
+
+impl Shared {
+    fn new() -> Arc<Shared> {
+        Arc::new(Shared {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            filters: Mutex::new(Accept::default()),
+            notify: Mutex::new(Notify::default()),
+        })
+    }
+
+    /// Producer side: apply acceptance filtering, enqueue (dropping when full),
+    /// wake any blocked reader, then fire the notify callback if armed for RX.
+    fn push(&self, f: Frame) {
+        if !self.filters.lock().unwrap_or_else(|e| e.into_inner()).accepts(&f) {
+            return;
+        }
+        let notify_id = wire::canid_to_kvaser(f.can_id, f.fd).0;
+        {
+            let mut q = self.q.lock().unwrap_or_else(|e| e.into_inner());
+            if q.len() >= RING_CAP {
+                return; // ring full -> drop, no wakeup
+            }
+            q.push_back(f);
+        }
+        self.cv.notify_one();
+        let n = *self.notify.lock().unwrap_or_else(|e| e.into_inner());
+        if n.cb != 0 && n.flags & NOTIFY_RX != 0 {
+            // SAFETY: cb is the function pointer the app passed to canSetNotify;
+            // the app contracts to keep it valid until canClose / canSetNotify(NULL).
+            unsafe {
+                let cb: extern "system" fn(*mut NotifyData) = std::mem::transmute(n.cb);
+                let mut d = NotifyData {
+                    tag: n.tag as *mut c_void,
+                    event_type: EVENT_RX,
+                    id: notify_id as c_long,
+                    time: 0,
+                };
+                cb(&mut d);
+            }
+        }
+    }
+
+    /// Non-blocking pop (backs `canRead`).
+    pub fn pop(&self) -> Option<Frame> {
+        self.q.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+    }
+
+    /// Block up to `timeout` for a frame, then pop it (backs `canReadWait`).
+    pub fn pop_wait(&self, timeout: Duration) -> Option<Frame> {
+        let q = self.q.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut q, _) = self
+            .cv
+            .wait_timeout_while(q, timeout, |q| q.is_empty())
+            .unwrap_or_else(|e| e.into_inner());
+        q.pop_front()
+    }
+
+    /// Block up to `timeout` until a frame is available, without removing it
+    /// (backs `canReadSync`). Returns true if one is available.
+    pub fn peek_wait(&self, timeout: Duration) -> bool {
+        let q = self.q.lock().unwrap_or_else(|e| e.into_inner());
+        let (q, _) = self
+            .cv
+            .wait_timeout_while(q, timeout, |q| q.is_empty())
+            .unwrap_or_else(|e| e.into_inner());
+        !q.is_empty()
+    }
+
+    /// Drop all queued frames (backs `canFlushReceiveQueue`).
+    pub fn clear(&self) {
+        self.q.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Current number of queued frames (backs canIOCTL_GET_RX_BUFFER_LEVEL).
+    pub fn level(&self) -> usize {
+        self.q.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Apply one `canAccept` directive (canFILTER_SET_{CODE,MASK}_{STD,EXT}).
+    pub fn set_accept(&self, flag: u32, envelope: u32) {
+        let mut a = self.filters.lock().unwrap_or_else(|e| e.into_inner());
+        match flag {
+            3 => a.code_std = envelope, // canFILTER_SET_CODE_STD
+            4 => a.mask_std = envelope, // canFILTER_SET_MASK_STD
+            5 => a.code_ext = envelope, // canFILTER_SET_CODE_EXT
+            6 => a.mask_ext = envelope, // canFILTER_SET_MASK_EXT
+            _ => {}
+        }
+    }
+
+    /// Arm/replace the notify callback (backs `canSetNotify`; cb==0 disarms).
+    pub fn set_notify(&self, cb: usize, flags: u32, tag: usize) {
+        *self.notify.lock().unwrap_or_else(|e| e.into_inner()) = Notify { cb, flags, tag };
+    }
+}
+
 enum Tx {
     Udp { sock: UdpSocket, remote: SocketAddr, seq: u8 },
     Tcp { stream: TcpStream },
@@ -24,7 +181,7 @@ enum Tx {
 
 pub struct Conn {
     tx: Mutex<Tx>,
-    rx: Arc<Mutex<VecDeque<Frame>>>,
+    shared: Arc<Shared>,
     running: Arc<AtomicBool>,
     negotiated: Arc<AtomicBool>,
     rx_sock: RxStop,
@@ -39,21 +196,13 @@ enum RxStop {
     Tcp(TcpStream),
 }
 
-fn ring_push(rx: &Mutex<VecDeque<Frame>>, f: Frame) {
-    if let Ok(mut q) = rx.lock() {
-        if q.len() < RING_CAP {
-            q.push_back(f);
-        } // else: ring full -> drop
-    }
-}
-
 impl Conn {
     pub fn connect(cfg: &Config) -> std::io::Result<Conn> {
         let remote: SocketAddr = format!("{}:{}", cfg.host, cfg.remote_port)
             .parse()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad host"))?;
 
-        let rx: Arc<Mutex<VecDeque<Frame>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let shared = Shared::new();
         let running = Arc::new(AtomicBool::new(true));
         let negotiated = Arc::new(AtomicBool::new(false));
 
@@ -65,11 +214,11 @@ impl Conn {
             rx_sock.set_read_timeout(Some(Duration::from_millis(500)))?;
             negotiated.store(true, Ordering::SeqCst);
 
-            let (rxq, run) = (rx.clone(), running.clone());
+            let (rxq, run) = (shared.clone(), running.clone());
             let handle = std::thread::spawn(move || udp_rx_loop(rx_sock, rxq, run));
             return Ok(Conn {
                 tx: Mutex::new(Tx::Udp { sock: tx_sock, remote, seq: 0 }),
-                rx,
+                shared,
                 running,
                 negotiated,
                 rx_sock: RxStop::Udp(sock), // original handle, used to stop the loop
@@ -97,12 +246,12 @@ impl Conn {
         let tx_stream = stream.try_clone()?;
         let stop_stream = stream;
 
-        let (rxq, run) = (rx.clone(), running.clone());
+        let (rxq, run) = (shared.clone(), running.clone());
         let handle = std::thread::spawn(move || tcp_rx_loop(rx_stream, rxq, run));
 
         Ok(Conn {
             tx: Mutex::new(Tx::Tcp { stream: tx_stream }),
-            rx,
+            shared,
             running,
             negotiated,
             rx_sock: RxStop::Tcp(stop_stream),
@@ -140,7 +289,34 @@ impl Conn {
     }
 
     pub fn read(&self) -> Option<Frame> {
-        self.rx.lock().ok().and_then(|mut q| q.pop_front())
+        self.shared.pop()
+    }
+
+    /// Clone of the shared RX state, so a blocking read (`canReadWait` /
+    /// `canReadSync`) can wait on the condvar *without* holding the global
+    /// `CONN` lock — otherwise `canClose` and concurrent calls would stall.
+    pub fn rx_shared(&self) -> Arc<Shared> {
+        self.shared.clone()
+    }
+
+    /// Drop all queued RX frames (`canFlushReceiveQueue`).
+    pub fn clear_rx(&self) {
+        self.shared.clear();
+    }
+
+    /// Number of queued RX frames (canIOCTL_GET_RX_BUFFER_LEVEL).
+    pub fn rx_level(&self) -> usize {
+        self.shared.level()
+    }
+
+    /// Apply one `canAccept` filter directive.
+    pub fn set_accept(&self, flag: u32, envelope: u32) {
+        self.shared.set_accept(flag, envelope);
+    }
+
+    /// Arm/replace the `canSetNotify` callback (cb==0 disarms).
+    pub fn set_notify(&self, cb: usize, flags: u32, tag: usize) {
+        self.shared.set_notify(cb, flags, tag);
     }
 
     pub fn close(&mut self) {
@@ -197,14 +373,14 @@ fn accept_with_timeout(l: &TcpListener, total: Duration) -> std::io::Result<(Tcp
     }
 }
 
-fn udp_rx_loop(sock: UdpSocket, rx: Arc<Mutex<VecDeque<Frame>>>, running: Arc<AtomicBool>) {
+fn udp_rx_loop(sock: UdpSocket, rx: Arc<Shared>, running: Arc<AtomicBool>) {
     let mut buf = [0u8; 2048];
     while running.load(Ordering::SeqCst) {
         match sock.recv_from(&mut buf) {
             Ok((n, _from)) => {
                 if let Some(frames) = wire::parse_udp(&buf[..n]) {
                     for f in frames {
-                        ring_push(&rx, f);
+                        rx.push(f);
                     }
                 }
             }
@@ -218,7 +394,7 @@ fn udp_rx_loop(sock: UdpSocket, rx: Arc<Mutex<VecDeque<Frame>>>, running: Arc<At
     }
 }
 
-fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Mutex<VecDeque<Frame>>>, running: Arc<AtomicBool>) {
+fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Shared>, running: Arc<AtomicBool>) {
     let mut f = Frame::default();
     let mut st = DecodeState::Init;
     // prime: Init -> asks for the CAN_ID size
@@ -237,7 +413,7 @@ fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Mutex<VecDeque<Frame>>>, running: 
         match wire::decode_stream(&chunk[..need], &mut f, &mut st) {
             Decoded::Need(n) => need = n,
             Decoded::Complete => {
-                ring_push(&rx, f);
+                rx.push(f);
                 f = Frame::default();
                 st = DecodeState::Init;
                 need = match wire::decode_stream(&[], &mut f, &mut st) {
@@ -247,5 +423,112 @@ fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Mutex<VecDeque<Frame>>>, running: 
             }
             Decoded::Error => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(can_id: u32) -> Frame {
+        Frame { can_id, len: 1, fd: false, fd_flags: 0, data: [0u8; 64] }
+    }
+
+    #[test]
+    fn push_pop_and_clear() {
+        let s = Shared::new();
+        s.push(frame(0x100));
+        s.push(frame(0x200));
+        assert_eq!(s.level(), 2);
+        assert_eq!(s.pop().map(|f| f.can_id), Some(0x100));
+        s.clear();
+        assert_eq!(s.level(), 0);
+        assert!(s.pop().is_none());
+    }
+
+    #[test]
+    fn accept_filter_drops_nonmatching() {
+        let s = Shared::new();
+        // Only accept standard ids equal to 0x123 (exact match mask).
+        s.set_accept(3, 0x123); // SET_CODE_STD
+        s.set_accept(4, wire::CAN_SFF_MASK); // SET_MASK_STD
+        s.push(frame(0x123));
+        s.push(frame(0x124));
+        assert_eq!(s.level(), 1);
+        assert_eq!(s.pop().map(|f| f.can_id), Some(0x123));
+    }
+
+    #[test]
+    fn ext_filter_independent_of_std() {
+        let s = Shared::new();
+        s.set_accept(5, 0x18EE_FF00); // SET_CODE_EXT
+        s.set_accept(6, wire::CAN_EFF_MASK); // SET_MASK_EXT
+        // Standard frames still pass (std mask defaults to 0 = accept all).
+        s.push(frame(0x123));
+        // Extended frame matching the code passes; non-matching is dropped.
+        s.push(frame(0x18EE_FF00 | wire::CAN_EFF_FLAG));
+        s.push(frame(0x18EE_FF01 | wire::CAN_EFF_FLAG));
+        assert_eq!(s.level(), 2);
+    }
+
+    #[test]
+    fn pop_wait_times_out_when_empty() {
+        let s = Shared::new();
+        assert!(s.pop_wait(Duration::from_millis(20)).is_none());
+    }
+
+    #[test]
+    fn pop_wait_returns_pushed_frame() {
+        let s = Shared::new();
+        let s2 = s.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            s2.push(frame(0x321));
+        });
+        let got = s.pop_wait(Duration::from_secs(2));
+        t.join().unwrap();
+        assert_eq!(got.map(|f| f.can_id), Some(0x321));
+    }
+
+    #[test]
+    fn peek_wait_leaves_frame_queued() {
+        let s = Shared::new();
+        s.push(frame(0x55));
+        assert!(s.peek_wait(Duration::from_millis(10)));
+        assert_eq!(s.level(), 1); // not consumed
+    }
+
+    static NOTIFY_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static NOTIFY_LAST_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    extern "system" fn test_cb(d: *mut NotifyData) {
+        unsafe {
+            NOTIFY_COUNT.fetch_add(1, Ordering::SeqCst);
+            NOTIFY_LAST_ID.store((*d).id as i64, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn notify_fires_for_each_rx_when_armed() {
+        let s = Shared::new();
+        NOTIFY_COUNT.store(0, Ordering::SeqCst);
+        s.set_notify(test_cb as *const () as usize, NOTIFY_RX, 0);
+        s.push(frame(0x111));
+        s.push(frame(0x222));
+        assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(NOTIFY_LAST_ID.load(Ordering::SeqCst), 0x222);
+        // Disarm: no further callbacks.
+        s.set_notify(0, 0, 0);
+        s.push(frame(0x333));
+        assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn notify_silent_when_flag_not_set() {
+        let s = Shared::new();
+        NOTIFY_COUNT.store(0, Ordering::SeqCst);
+        s.set_notify(test_cb as *const () as usize, 0 /* no NOTIFY_RX */, 0);
+        s.push(frame(0x111));
+        assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 0);
     }
 }

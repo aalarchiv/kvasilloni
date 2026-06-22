@@ -4,7 +4,7 @@
 #   make dll32      build only the 32-bit DLL
 #   make dll64      build only the 64-bit DLL
 #   make test       run host unit tests (wire codec, golden vectors)
-#   make verify     confirm the 13 exports are present and undecorated (32-bit)
+#   make verify     confirm the exports are present and undecorated (32-bit)
 #   make selftest   end-to-end over vcan1 + cannelloni + wine (needs root/wine)
 #   make clean
 
@@ -15,7 +15,12 @@ DLL64 := target/$(T64)/release/canlib32.dll
 
 EXPORTS := canInitializeLibrary canOpenChannel canSetBusParams canBusOn canBusOff \
            canWrite canRead canReadStatus canReadErrorCounters canGetBusStatistics \
-           canGetErrorText canGetVersion canClose
+           canGetErrorText canGetVersion canClose \
+           canFlushReceiveQueue canFlushTransmitQueue \
+           canSetBusOutputControl canGetBusOutputControl \
+           canReadWait canReadSync canWriteWait canWriteSync \
+           canIoCtl canAccept canObjBufSetFilter \
+           canGetNumberOfChannels canGetChannelData canSetNotify
 
 .PHONY: all dll32 dll64 test verify selftest clean
 

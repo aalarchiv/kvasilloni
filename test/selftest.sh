@@ -151,6 +151,61 @@ CANENV="" \
   run_case "UDP (INI config, no env)" -I "$VCAN" -R 127.0.0.1 -r 20107 -l 20106
 rm -f "$BUILD/kvasilloni.ini"
 
+# ===================== extended exports (epic kvasilloni-5yp) =====================
+
+# --- channel enumeration (canGetNumberOfChannels / canGetChannelData) ---
+# No cannelloni needed; the shim answers from config. KVASILLONI_CHANNELS=2.
+echo; echo "===== CASE: channel enumeration (--enum) ====="
+enum_out="$(mktemp)"
+( cd "$BUILD" && KVASILLONI_CHANNELS=2 wine ./canshim_probe.exe --enum ) > "$enum_out" 2>/dev/null
+if grep -qE "ENUM count=2 st=0" "$enum_out" && grep -qE 'ENUM name="kvasilloni vcan0" st=0' "$enum_out"; then
+  echo "  PASS: enumerated 2 channels and read channel name"
+else
+  echo "  FAIL: enumeration output unexpected"; sed 's/^/    /' "$enum_out"; FAIL=1
+fi
+rm -f "$enum_out"
+
+# --- acceptance filtering (canAccept): inject two ids, only one accepted ---
+echo; echo "===== CASE: acceptance filter (--accept, UDP) ====="
+acc_out="$(mktemp)"
+"$CANNBIN" -I "$VCAN" -R 127.0.0.1 -r 20109 -l 20108 >/dev/null 2>&1 & ACNPID=$!; PIDS+=("$ACNPID")
+sleep 1.0
+( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20108 KVASILLONI_LOCALPORT=20109 \
+    wine ./canshim_probe.exe --accept 0x18FF0201 ext ) > "$acc_out" 2>/dev/null & ACPBPID=$!; PIDS+=("$ACPBPID")
+sleep 2.0
+cansend "$VCAN" "18FF0201#AA" 2>/dev/null   # accepted
+cansend "$VCAN" "18FF0202#BB" 2>/dev/null   # rejected
+echo "  injected: 18FF0201 (accept) and 18FF0202 (reject)"
+wait "$ACPBPID" 2>/dev/null
+kill "$ACNPID" 2>/dev/null
+sleep 0.8
+if grep -qE "RX id=0x18FF0201" "$acc_out" && ! grep -qE "RX id=0x18FF0202" "$acc_out"; then
+  echo "  PASS: only the accepted id reached canRead"
+else
+  echo "  FAIL: acceptance filtering wrong"; sed 's/^/    /' "$acc_out"; FAIL=1
+fi
+rm -f "$acc_out"
+
+# --- notifications (canSetNotify): N injected frames => N callbacks ---
+echo; echo "===== CASE: notify callback (--notify, UDP) ====="
+not_out="$(mktemp)"
+"$CANNBIN" -I "$VCAN" -R 127.0.0.1 -r 20111 -l 20110 >/dev/null 2>&1 & NTNPID=$!; PIDS+=("$NTNPID")
+sleep 1.0
+( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20110 KVASILLONI_LOCALPORT=20111 \
+    wine ./canshim_probe.exe --notify ) > "$not_out" 2>/dev/null & NTPBPID=$!; PIDS+=("$NTPBPID")
+sleep 2.0
+for n in 1 2 3; do cansend "$VCAN" "18FF030$n#0$n" 2>/dev/null; sleep 0.2; done
+echo "  injected: 3 frames"
+wait "$NTPBPID" 2>/dev/null
+kill "$NTNPID" 2>/dev/null
+sleep 0.8
+if grep -qE "NOTIFY count=3" "$not_out"; then
+  echo "  PASS: received 3 notify callbacks for 3 frames"
+else
+  echo "  FAIL: notify count wrong"; sed 's/^/    /' "$not_out"; FAIL=1
+fi
+rm -f "$not_out"
+
 echo
 if [ "$FAIL" = 0 ]; then echo "SELFTEST: PASS"; else echo "SELFTEST: FAIL"; fi
 exit "$FAIL"
