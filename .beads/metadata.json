@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "kvasilloni",
+  "project_id": "5f93040e-930f-41bd-bb9b-2b80b46346b1"
+}
