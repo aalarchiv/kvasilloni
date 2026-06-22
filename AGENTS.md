@@ -1,5 +1,39 @@
 # Agent Instructions
 
+> **AI-FIRST NOTE — DLL export coverage when retargeting a new app**
+>
+> The shim's `canlib32.dll` exports only the **13 CANlib functions** the *current*
+> target app (czone `configuration-tool.exe`) resolves. It is **NOT** a general
+> replacement for the full Kvaser `canlib32.dll` (which exports hundreds).
+>
+> **Before pointing kvasilloni at a different application you MUST run an import
+> coverage check** — enumerate the canlib symbols the new app resolves and diff
+> them against what the shim exports. Any symbol the app imports that the shim
+> does not export will fail `GetProcAddress`/load and break that app.
+>
+> Procedure:
+> 1. List the new app's canlib imports (static import table *and* any dynamic
+>    `GetProcAddress` calls):
+>    ```bash
+>    # static imports of canlib32.dll referenced by the app:
+>    objdump -x THE_APP.exe | grep -iA40 'canlib32.dll'
+>    # dynamic resolution — scan for canXxx / kvXxx symbol strings the app may
+>    # pass to GetProcAddress (static table won't show these):
+>    strings -e l THE_APP.exe | grep -E '^(can|kv)[A-Z]'
+>    strings    THE_APP.exe | grep -E '^(can|kv)[A-Z]'
+>    ```
+>    (Under wine, `KVASILLONI_LOG` also records every resolved call at runtime —
+>    use it to catch dynamically-resolved symbols the static scan misses.)
+> 2. Diff that set against the shim's exports:
+>    ```bash
+>    make verify   # lists the 13 exported names
+>    ```
+> 3. For each missing symbol, implement it in `src/lib.rs` (+ add to the
+>    coverage/selftest) before declaring the new app supported. Update the README
+>    "Scope" section with the new export set.
+>
+> See `bd memories canlib` for the recorded rationale.
+
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
 ## Quick Reference
