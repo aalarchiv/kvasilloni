@@ -21,6 +21,51 @@ Instead of touching hardware, the shim **is itself a cannelloni peer**: it speak
 cannelloni's wire format directly to a stock `cannelloni` process on the Linux
 side. Nothing else is needed on Linux beyond `cannelloni` and a `vcan`.
 
+## Quickstart
+
+```bash
+# === BUILD (dev host) ===
+rustup target add i686-pc-windows-gnu x86_64-pc-windows-gnu
+make                       # -> target/{i686,x86_64}-pc-windows-gnu/release/canlib32.dll
+```
+
+```bash
+# === LINUX HOST (UDP) ===  <win-ip> = Windows VM address
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
+cannelloni -I vcan0 -R <win-ip> -r 20000 -l 20000
+```
+
+```ini
+; === WINDOWS VM ===  put canlib32.dll next to the app .exe, plus kvasilloni.ini:
+[cannelloni]
+host      = <linux-ip>
+port      = 20000
+localport = 20000
+proto     = udp
+```
+
+```bat
+:: launch the app (Interface Type = Kvaser). Optional one-off override + log:
+set KVASILLONI_HOST=<linux-ip>
+set KVASILLONI_LOG=C:\temp\kvasilloni.log
+your-can-app.exe
+```
+
+```bash
+# === TCP instead of UDP ===
+# Linux:   cannelloni -C s -R <win-ip> -I vcan0 -l 20000
+# Windows: kvasilloni.ini -> proto = tcp   (tcprole = client)
+```
+
+```bash
+# === VERIFY (dev host; needs wine, can-utils, cmake) ===
+make verify                # 13 exports present + undecorated
+make test                  # wire-codec unit tests
+make selftest              # full loopback over vcan1: classic UDP/TCP, CAN FD, INI
+```
+
 ## Scope
 
 The shim implements exactly the **13 CANlib functions** the target application
@@ -130,13 +175,16 @@ transport-protocol messages).
 ## Verify end-to-end
 
 `make selftest` runs a full loopback on this Linux host using an **isolated
-`vcan1`** (so it never disturbs anything on `vcan0`). It builds cannelloni, runs
-it for both UDP and TCP, launches a small probe under **wine** that loads the
-shim, and asserts that frames cross **both directions** over **both transports**:
+`vcan1`** (so it never disturbs anything on `vcan0`). It builds cannelloni,
+launches a small probe under **wine** that loads the shim, and asserts that frames
+cross **both directions** for four scenarios:
 
 ```
 make selftest
-# ... CASE: UDP / CASE: TCP ...
+# CASE: UDP (classic)        PASS (TX + RX)
+# CASE: TCP (classic)        PASS (TX + RX)
+# CASE: UDP (CAN FD + BRS)   PASS (TX + RX)
+# CASE: UDP (INI config, no env)  PASS (TX + RX)
 # SELFTEST: PASS
 ```
 
