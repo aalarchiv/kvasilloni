@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-3.0-or-later */
 /*
- * canshim_probe.exe — the Windows-side actor for the end-to-end selftest.
+ * canshim_probe.exe - the Windows-side actor for the end-to-end selftest.
  *
  * Loads canlib32.dll the same way the real app does (LoadLibrary +
  * GetProcAddress, by undecorated name), opens a channel, writes one frame, then

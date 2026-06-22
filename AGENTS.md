@@ -1,13 +1,13 @@
 # Agent Instructions
 
-> **AI-FIRST NOTE — DLL export coverage when retargeting a new app**
+> **AI-FIRST NOTE - DLL export coverage when retargeting a new app**
 >
 > The shim's `canlib32.dll` exports only the **13 CANlib functions** the *current*
 > target app (czone `configuration-tool.exe`) resolves. It is **NOT** a general
 > replacement for the full Kvaser `canlib32.dll` (which exports hundreds).
 >
 > **Before pointing kvasilloni at a different application you MUST run an import
-> coverage check** — enumerate the canlib symbols the new app resolves and diff
+> coverage check** - enumerate the canlib symbols the new app resolves and diff
 > them against what the shim exports. Any symbol the app imports that the shim
 > does not export will fail `GetProcAddress`/load and break that app.
 >
@@ -17,12 +17,12 @@
 >    ```bash
 >    # static imports of canlib32.dll referenced by the app:
 >    objdump -x THE_APP.exe | grep -iA40 'canlib32.dll'
->    # dynamic resolution — scan for canXxx / kvXxx symbol strings the app may
+>    # dynamic resolution - scan for canXxx / kvXxx symbol strings the app may
 >    # pass to GetProcAddress (static table won't show these):
 >    strings -e l THE_APP.exe | grep -E '^(can|kv)[A-Z]'
 >    strings    THE_APP.exe | grep -E '^(can|kv)[A-Z]'
 >    ```
->    (Under wine, `KVASILLONI_LOG` also records every resolved call at runtime —
+>    (Under wine, `KVASILLONI_LOG` also records every resolved call at runtime -
 >    use it to catch dynamically-resolved symbols the static scan misses.)
 > 2. Diff that set against the shim's exports:
 >    ```bash
@@ -86,9 +86,9 @@ bd close <id>         # Complete work
 
 ### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Use `bd` for ALL task tracking - do NOT use TodoWrite, TaskCreate, or markdown TODO lists
 - Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- Use `bd remember` for persistent knowledge - do NOT use MEMORY.md files
 
 ## Session Completion
 

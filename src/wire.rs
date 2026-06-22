@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! cannelloni wire-format codec + Kvaser <-> SocketCAN id translation.
 //!
-//! An independent implementation of the cannelloni wire protocol — UDP
-//! (packet-framed) and TCP (headerless streaming) — so the shim interoperates
+//! An independent implementation of the cannelloni wire protocol - UDP
+//! (packet-framed) and TCP (headerless streaming) - so the shim interoperates
 //! as a cannelloni peer. It reproduces only the on-the-wire byte layout needed
 //! for that interop and is verified against golden byte vectors in the tests
 //! below.

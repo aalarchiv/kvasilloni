@@ -2,7 +2,7 @@
 
 A drop-in replacement for Kvaser's **`canlib32.dll`** that bridges a Windows CAN
 application to a **Linux `vcan`** over the network using
-[cannelloni](https://github.com/mguentner/cannelloni) — no Kvaser hardware, no
+[cannelloni](https://github.com/mguentner/cannelloni) - no Kvaser hardware, no
 kernel driver.
 
 The intended use case: CAN software running in a **Windows 11 VM** (that drives
@@ -11,10 +11,10 @@ on a separate Linux host**.
 
 ```
  Windows 11 VM                                       Linux host
-┌───────────────────────────┐                      ┌───────────────────────────┐
-│ CAN application           │      cannelloni      │ cannelloni -I vcan0 ...   │
-│  canlib32.dll  (SHIM)     ┼────── UDP/TCP ───────┼ vcan0  <->  your CAN code │
-└───────────────────────────┘  (LAN / host link)   └───────────────────────────┘
++---------------------------+                      +---------------------------+
+| CAN application           |      cannelloni      | cannelloni -I vcan0 ...   |
+|  canlib32.dll  (SHIM)     +------ UDP/TCP -------+ vcan0  <->  your CAN code |
++---------------------------+  (LAN / host link)   +---------------------------+
 ```
 
 Instead of touching hardware, the shim **is itself a cannelloni peer**: it speaks
@@ -78,7 +78,7 @@ canWrite              canRead          canReadStatus    canReadErrorCounters
 canGetBusStatistics  canGetErrorText  canGetVersion    canClose
 ```
 
-Classic CAN frames (11-bit and 29-bit IDs, DLC 0–8, RTR) and **CAN FD**
+Classic CAN frames (11-bit and 29-bit IDs, DLC 0-8, RTR) and **CAN FD**
 (`canFDMSG_FDF`/`BRS`/`ESI`, payloads up to 64 bytes, DLC auto-rounded to a valid
 FD length) are supported in both directions.
 
@@ -92,7 +92,7 @@ targeting a new app):
 |---|---|
 | `canFlushReceiveQueue` / `canFlushTransmitQueue` | clears the RX ring / no-op (TX is synchronous) |
 | `canSetBusOutputControl` / `canGetBusOutputControl` | stores & returns the driver type (default `canDRIVER_NORMAL`) |
-| `canReadWait` / `canReadSync` | blocking read / wait-for-available, honoring the ms timeout (`canWAIT_INFINITE` ≈ unbounded) |
+| `canReadWait` / `canReadSync` | blocking read / wait-for-available, honoring the ms timeout (`canWAIT_INFINITE` ~ unbounded) |
 | `canWriteWait` / `canWriteSync` | send synchronously, ignoring the timeout |
 | `canIoCtl` | dispatches `canIOCTL_FLUSH_RX/TX_BUFFER`, `GET/SET_TIMER_SCALE`, `SET_TXACK/TXRQ`, `GET_RX/TX_BUFFER_LEVEL`; unknown funcs return `canERR_NOT_IMPLEMENTED` |
 | `canAccept` | real acceptance filtering: drops frames where `(id & mask) != (code & mask)` (separate STD/EXT code+mask; zero mask = accept all) |
@@ -104,7 +104,7 @@ targeting a new app):
 **`canSetNotify` threading caveat:** the registered callback is invoked **on the
 shim's RX thread**, not the thread that called `canSetNotify`. Keep it short and
 non-blocking, and ensure the function pointer stays valid until you disarm it
-(`canSetNotify(h, NULL, …)`) or `canClose`. Only `canNOTIFY_RX` is delivered.
+(`canSetNotify(h, NULL, ...)`) or `canClose`. Only `canNOTIFY_RX` is delivered.
 
 ## Build
 
@@ -134,7 +134,7 @@ matches your Windows application's bitness (most legacy Kvaser apps are 32-bit).
 
 ### Configuration
 
-The shim is configured by an **INI file** — the Windows-native mechanism. It looks
+The shim is configured by an **INI file** - the Windows-native mechanism. It looks
 for `kvasilloni.ini` next to the DLL, then next to the application's .exe
 (`KVASILLONI_INI` may give an explicit path). See `kvasilloni.ini.example`:
 
@@ -150,7 +150,7 @@ tcprole   = client         ; client | server  (tcp only)
 
 Every setting can also be overridden by an **environment variable**, which takes
 precedence over the INI (handy for scripting/CI). Precedence is
-**defaults → INI → environment**.
+**defaults -> INI -> environment**.
 
 | Variable            | INI key     | Default     | Meaning                              |
 |---------------------|-------------|-------------|--------------------------------------|
@@ -160,7 +160,7 @@ precedence over the INI (handy for scripting/CI). Precedence is
 | `KVASILLONI_PROTO`     | `proto`     | `udp`       | `udp` or `tcp`                       |
 | `KVASILLONI_TCPROLE`   | `tcprole`   | `client`    | `client` or `server` (TCP only)      |
 | `KVASILLONI_LOG`       | `log`       | (unset)     | If set, append a debug log here      |
-| `KVASILLONI_INI`       | —           | (auto)      | Explicit path to the INI file        |
+| `KVASILLONI_INI`       | -           | (auto)      | Explicit path to the INI file        |
 
 ## Linux side (cannelloni)
 
@@ -172,7 +172,7 @@ sudo ip link add dev vcan0 type vcan
 sudo ip link set up vcan0
 ```
 
-**UDP** (default; symmetric — each side binds its local port and sends to the
+**UDP** (default; symmetric - each side binds its local port and sends to the
 remote). Replace `<win-ip>` with the Windows VM's address:
 
 ```bash
@@ -217,24 +217,24 @@ make selftest
 
 ## How it works
 
-- **`src/wire.rs`** — the cannelloni codec: per-frame `encode`/`decode`, the
+- **`src/wire.rs`** - the cannelloni codec: per-frame `encode`/`decode`, the
   UDP packet builder/parser, the TCP streaming decoder state machine, and the
-  Kvaser↔SocketCAN ID/flag translation. An independent implementation of the
+  Kvaser<->SocketCAN ID/flag translation. An independent implementation of the
   cannelloni wire protocol, unit-tested against golden byte vectors.
-- **`src/transport.rs`** — UDP and TCP (client/server) transports with a
+- **`src/transport.rs`** - UDP and TCP (client/server) transports with a
   background RX thread feeding a bounded ring; `canWrite` sends one frame,
   `canRead` drains the ring (`canERR_NOMSG` when empty).
-- **`src/config.rs`** — layered config (defaults → `kvasilloni.ini` → env). Finds
+- **`src/config.rs`** - layered config (defaults -> `kvasilloni.ini` -> env). Finds
   the INI next to the DLL or the .exe via `GetModuleFileNameW`.
-- **`src/lib.rs`** — the `extern "system"` exports (13 core + the extended
+- **`src/lib.rs`** - the `extern "system"` exports (13 core + the extended
   retargeting set). Each wraps its body in `catch_unwind` so a stray panic
   becomes a CANlib error code, never an unwind across the FFI boundary.
 
 ### Wire format (cannelloni, for reference)
 
-Per frame: `can_id` (4 bytes, big-endian, SocketCAN flag bits in the top —
-`EFF 0x80000000`, `RTR 0x40000000`) · `len` (1 byte; `0x80` ⇒ CAN-FD) · `flags`
-(1 byte, only if CAN-FD) · `data[len]` (omitted for RTR).
+Per frame: `can_id` (4 bytes, big-endian, SocketCAN flag bits in the top -
+`EFF 0x80000000`, `RTR 0x40000000`) | `len` (1 byte; `0x80` => CAN-FD) | `flags`
+(1 byte, only if CAN-FD) | `data[len]` (omitted for RTR).
 **UDP** prefixes a 5-byte header `{ version=2, op=DATA(0), seq, count(BE u16) }`
 and packs `count` frames. **TCP** opens with both peers exchanging the ASCII
 string `CANNELLONIv1`, then streams frames back-to-back with no packet header.
@@ -250,5 +250,5 @@ implementation that emulates the CANlib export interface and speaks the
 cannelloni wire protocol over the network to interoperate with a stock,
 separately-running `cannelloni` process. LGPL was chosen because the DLL is
 designed to be loaded by other applications (including proprietary ones) as a
-drop-in replacement — the library itself stays open and user-replaceable, while
+drop-in replacement - the library itself stays open and user-replaceable, while
 the programs that load it are unaffected.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! canlib32.dll — a drop-in Kvaser CANlib shim that bridges to a Linux `vcan`
+//! canlib32.dll - a drop-in Kvaser CANlib shim that bridges to a Linux `vcan`
 //! via cannelloni (UDP or TCP), with no Kvaser hardware or driver.
 //!
 //! Implements the 13 CANlib symbols the target Windows app resolves, plus an

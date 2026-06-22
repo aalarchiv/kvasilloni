@@ -190,7 +190,7 @@ pub struct Conn {
 }
 
 /// Handle used by `close` to unblock the RX thread. The UDP variant is never
-/// read — it just keeps the original bound socket alive for the connection's
+/// read - it just keeps the original bound socket alive for the connection's
 /// lifetime; the RX loop stops via its read timeout. TCP is shut down explicitly.
 enum RxStop {
     Udp(#[allow(dead_code)] UdpSocket),
@@ -295,7 +295,7 @@ impl Conn {
 
     /// Clone of the shared RX state, so a blocking read (`canReadWait` /
     /// `canReadSync`) can wait on the condvar *without* holding the global
-    /// `CONN` lock — otherwise `canClose` and concurrent calls would stall.
+    /// `CONN` lock - otherwise `canClose` and concurrent calls would stall.
     pub fn rx_shared(&self) -> Arc<Shared> {
         self.shared.clone()
     }

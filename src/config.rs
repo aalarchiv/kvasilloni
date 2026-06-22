@@ -116,7 +116,7 @@ fn starts_with_ci(s: &str, c: u8) -> bool {
 }
 
 /// Minimal INI parser: `key = value`, `;`/`#` comments, optional `[section]`
-/// headers (ignored — all keys are flattened). Keys are lowercased.
+/// headers (ignored - all keys are flattened). Keys are lowercased.
 fn parse_ini(text: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for line in text.lines() {

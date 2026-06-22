@@ -1,4 +1,4 @@
-# kvasilloni — Kvaser canlib32.dll cannelloni shim (Rust)
+# kvasilloni - Kvaser canlib32.dll cannelloni shim (Rust)
 #
 #   make            build 32-bit + 64-bit canlib32.dll (release)
 #   make dll32      build only the 32-bit DLL
