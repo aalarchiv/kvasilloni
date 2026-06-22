@@ -1,0 +1,8 @@
+# Strip the 32-bit stdcall @N decoration from DLL exports (same trick the C
+# prototype used via -Wl,--kill-at) so the exported names exactly match Kvaser's
+# canlib32.dll. Harmless on x86_64 (no stdcall decoration there).
+[target.i686-pc-windows-gnu]
+rustflags = ["-C", "link-args=-Wl,--kill-at"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-args=-Wl,--kill-at"]

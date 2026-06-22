@@ -3,3 +3,12 @@
 .dolt/
 *.db
 .beads-credential-key
+
+# reference projects, docs, etc that must not get into repo
+refs/
+
+# Rust / cargo build output
+/target/
+
+# C prototype build output
+/reference/c-prototype/build/

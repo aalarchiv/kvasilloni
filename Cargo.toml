@@ -1,0 +1,21 @@
+[package]
+name = "canlib32"
+version = "0.1.0"
+edition = "2021"
+description = "Drop-in Kvaser canlib32.dll shim that bridges to a Linux vcan via cannelloni (UDP/TCP)"
+license = "MIT"
+
+[lib]
+name = "canlib32"
+# cdylib => produces canlib32.dll. The 13 Kvaser symbols are exported via
+# #[no_mangle] extern "system"; -Wl,--kill-at (see .cargo/config.toml) strips the
+# 32-bit stdcall @N decoration so the names match Kvaser's real DLL.
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+# Keep default unwinding: each exported fn wraps its body in catch_unwind so a
+# stray panic becomes a CANlib error code instead of crossing the FFI boundary.
