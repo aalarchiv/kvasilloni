@@ -1,10 +1,5 @@
 # kvasilloni
 
-[![License: LGPL v3](https://img.shields.io/badge/License-LGPLv3-blue.svg)](COPYING.LESSER)
-![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
-![Platform: Windows 32/64-bit](https://img.shields.io/badge/platform-Windows%2032%2F64--bit-lightgrey.svg)
-![Transport: cannelloni UDP/TCP](https://img.shields.io/badge/transport-cannelloni%20UDP%2FTCP-informational.svg)
-
 A drop-in replacement for Kvaser's **`canlib32.dll`** that bridges a Windows CAN
 application to a **Linux `vcan`** over the network using
 [cannelloni](https://github.com/mguentner/cannelloni) — no Kvaser hardware, no
