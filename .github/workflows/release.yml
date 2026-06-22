@@ -1,7 +1,8 @@
 name: release
 
 # Build the Windows DLLs and publish a GitHub release ONLY when a version tag
-# is pushed (e.g. v0.2.0). No build runs on ordinary branch pushes.
+# is pushed (e.g. v0.2.0). No build runs on ordinary branch pushes. Each arch
+# ships as a self-contained zip (DLL + README + license + INI example).
 on:
   push:
     tags:
@@ -22,7 +23,7 @@ jobs:
           - target: x86_64-pc-windows-gnu
             arch: x64      # 64-bit
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install mingw-w64 cross linkers
         run: |
@@ -35,16 +36,20 @@ jobs:
       - name: Build release DLL
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Stage artifact
+      - name: Assemble per-arch zip
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/canlib32.dll" \
-             "dist/canlib32-${{ matrix.arch }}.dll"
+          pkg="kvasilloni-${{ github.ref_name }}-${{ matrix.arch }}"
+          mkdir -p "dist/$pkg"
+          cp "target/${{ matrix.target }}/release/canlib32.dll" "dist/$pkg/canlib32.dll"
+          cp README.md kvasilloni.ini.example COPYING COPYING.LESSER "dist/$pkg/"
+          (cd dist && zip -r "$pkg.zip" "$pkg")
+          echo "== $pkg.zip =="
+          unzip -l "dist/$pkg.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: dll-${{ matrix.arch }}
-          path: dist/canlib32-${{ matrix.arch }}.dll
+          name: zip-${{ matrix.arch }}
+          path: dist/kvasilloni-${{ github.ref_name }}-${{ matrix.arch }}.zip
           if-no-files-found: error
 
   release:
@@ -52,26 +57,25 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download built DLLs
-        uses: actions/download-artifact@v4
+      - name: Download built zips
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Collect assets and compute checksums
         run: |
           mkdir -p release
-          find artifacts -name '*.dll' -exec cp {} release/ \;
+          find artifacts -name '*.zip' -exec cp {} release/ \;
           cd release
-          sha256sum *.dll > SHA256SUMS.txt
+          sha256sum *.zip > SHA256SUMS.txt
           echo "== SHA256SUMS.txt =="
           cat SHA256SUMS.txt
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
-            release/canlib32-x86.dll
-            release/canlib32-x64.dll
+            release/*.zip
             release/SHA256SUMS.txt
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -80,9 +84,10 @@ jobs:
 
             | Asset | Use for |
             |---|---|
-            | `canlib32-x86.dll` | 32-bit Windows apps (most legacy Kvaser apps) |
-            | `canlib32-x64.dll` | 64-bit Windows apps |
+            | `kvasilloni-${{ github.ref_name }}-x86.zip` | 32-bit Windows apps (most legacy Kvaser apps) |
+            | `kvasilloni-${{ github.ref_name }}-x64.zip` | 64-bit Windows apps |
 
-            Rename the matching file to `canlib32.dll` and drop it next to your
-            application's executable. Verify with `sha256sum -c SHA256SUMS.txt`
-            (after renaming the files back to the names listed there).
+            Each zip contains `canlib32.dll`, `README.md`, `kvasilloni.ini.example`,
+            and the LGPL license texts (`COPYING`, `COPYING.LESSER`). Drop
+            `canlib32.dll` next to your application's executable. Verify the
+            download with `sha256sum -c SHA256SUMS.txt`.
