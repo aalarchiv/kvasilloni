@@ -114,13 +114,13 @@ TXGREP="18EEFF00#?.*DEADBEEF|18EEFF00#DEADBEEF"
 RXGREP="RX id=0x18FF0102"
 
 # UDP: cannelloni listens 20100, sends to probe at 20101
-CANENV="CANSHIM_PROTO=udp CANSHIM_HOST=127.0.0.1 CANSHIM_PORT=20100 CANSHIM_LOCALPORT=20101" \
+CANENV="KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20100 KVASILLONI_LOCALPORT=20101" \
   run_case "UDP (classic)" -I "$VCAN" -R 127.0.0.1 -r 20101 -l 20100
 
 # TCP: cannelloni is server on 20102, shim connects as client.
 # -p disables cannelloni's peer-IP check (else it rejects our client's source IP
 # since no -R is set on a server). On a real deployment, set -R <win-ip> instead.
-CANENV="CANSHIM_PROTO=tcp CANSHIM_TCPROLE=client CANSHIM_HOST=127.0.0.1 CANSHIM_PORT=20102" \
+CANENV="KVASILLONI_PROTO=tcp KVASILLONI_TCPROLE=client KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20102" \
   run_case "TCP (classic)" -C s -p -I "$VCAN" -l 20102
 
 # --- CAN FD with bit-rate switch (over UDP) ---
@@ -131,10 +131,10 @@ TXGREP="18EEFF02##.*001122334455"
 # flag >= 0x10000 (5 hex digits, nonzero lead) => an FD flag bit is set (FDF/BRS/ESI)
 RXGREP="RX id=0x18FF0105 .*flag=0x[1-9a-fA-F][0-9a-fA-F]{4}"
 
-CANENV="CANSHIM_PROTO=udp CANSHIM_HOST=127.0.0.1 CANSHIM_PORT=20104 CANSHIM_LOCALPORT=20105" \
+CANENV="KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20104 KVASILLONI_LOCALPORT=20105" \
   run_case "UDP (CAN FD + BRS)" -I "$VCAN" -R 127.0.0.1 -r 20105 -l 20104
 
-# --- INI-based config (Windows-native): no CANSHIM_* config env at all ---
+# --- INI-based config (Windows-native): no KVASILLONI_* config env at all ---
 # The shim must auto-discover kvasilloni.ini next to the DLL (ports 20106/20107).
 cat > "$BUILD/kvasilloni.ini" <<EOF
 [cannelloni]

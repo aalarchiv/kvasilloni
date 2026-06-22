@@ -9,12 +9,12 @@
 //!   Windows app -> canlib32.dll (this) --UDP|TCP--> cannelloni -> vcan -> Linux CAN
 //!
 //! Config (environment, read at canOpenChannel):
-//!   CANSHIM_HOST      Linux cannelloni IP        (default 127.0.0.1)
-//!   CANSHIM_PORT      remote port to send to     (default 20000)
-//!   CANSHIM_LOCALPORT UDP bind / TCP server port (default 20000)
-//!   CANSHIM_PROTO     "udp" | "tcp"              (default "udp")
-//!   CANSHIM_TCPROLE   "client" | "server"        (default "client")
-//!   CANSHIM_LOG       path; if set, append a debug log
+//!   KVASILLONI_HOST      Linux cannelloni IP        (default 127.0.0.1)
+//!   KVASILLONI_PORT      remote port to send to     (default 20000)
+//!   KVASILLONI_LOCALPORT UDP bind / TCP server port (default 20000)
+//!   KVASILLONI_PROTO     "udp" | "tcp"              (default "udp")
+//!   KVASILLONI_TCPROLE   "client" | "server"        (default "client")
+//!   KVASILLONI_LOG       path; if set, append a debug log
 
 mod config;
 mod transport;
@@ -37,11 +37,11 @@ const CAN_ERR_NOTFOUND: c_int = -3;
 
 /// Single channel; the target app opens exactly one.
 static CONN: Mutex<Option<Conn>> = Mutex::new(None);
-/// Log path resolved from config at canOpenChannel (env `CANSHIM_LOG` still wins).
+/// Log path resolved from config at canOpenChannel (env `KVASILLONI_LOG` still wins).
 static LOG_PATH: Mutex<Option<String>> = Mutex::new(None);
 
 fn log(msg: &str) {
-    let path = std::env::var("CANSHIM_LOG")
+    let path = std::env::var("KVASILLONI_LOG")
         .ok()
         .or_else(|| LOG_PATH.lock().ok().and_then(|g| g.clone()));
     if let Some(path) = path {

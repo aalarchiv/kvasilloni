@@ -77,22 +77,22 @@ impl Config {
 
     fn apply_env(&mut self) {
         let e = |k: &str| std::env::var(k).ok();
-        if let Some(v) = e("CANSHIM_HOST") {
+        if let Some(v) = e("KVASILLONI_HOST") {
             self.host = v;
         }
-        if let Some(v) = e("CANSHIM_PORT").and_then(|v| v.parse().ok()) {
+        if let Some(v) = e("KVASILLONI_PORT").and_then(|v| v.parse().ok()) {
             self.remote_port = v;
         }
-        if let Some(v) = e("CANSHIM_LOCALPORT").and_then(|v| v.parse().ok()) {
+        if let Some(v) = e("KVASILLONI_LOCALPORT").and_then(|v| v.parse().ok()) {
             self.local_port = v;
         }
-        if let Some(v) = e("CANSHIM_PROTO") {
+        if let Some(v) = e("KVASILLONI_PROTO") {
             self.tcp = starts_with_ci(&v, b't');
         }
-        if let Some(v) = e("CANSHIM_TCPROLE") {
+        if let Some(v) = e("KVASILLONI_TCPROLE") {
             self.tcp_server = starts_with_ci(&v, b's');
         }
-        if let Some(v) = e("CANSHIM_LOG") {
+        if let Some(v) = e("KVASILLONI_LOG") {
             if !v.is_empty() {
                 self.log = Some(v);
             }
@@ -123,12 +123,12 @@ fn parse_ini(text: &str) -> HashMap<String, String> {
 }
 
 /// Search for `kvasilloni.ini` and parse it. Precedence:
-///   1. `CANSHIM_INI` (explicit path)
+///   1. `KVASILLONI_INI` (explicit path)
 ///   2. next to this DLL
 ///   3. next to the host application's .exe
 fn find_and_parse_ini() -> Option<HashMap<String, String>> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(p) = std::env::var("CANSHIM_INI") {
+    if let Ok(p) = std::env::var("KVASILLONI_INI") {
         if !p.is_empty() {
             candidates.push(PathBuf::from(p));
         }
@@ -204,7 +204,7 @@ fn module_path(h: sys::HModule) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)))
 }
 
-// Non-Windows (host `cargo test`): no module introspection; rely on CANSHIM_INI/env.
+// Non-Windows (host `cargo test`): no module introspection; rely on KVASILLONI_INI/env.
 #[cfg(not(windows))]
 fn exe_dir() -> Option<PathBuf> {
     None

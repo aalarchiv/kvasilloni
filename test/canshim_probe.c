@@ -5,7 +5,7 @@
  * GetProcAddress, by undecorated name), opens a channel, writes one frame, then
  * polls canRead for a few seconds and prints every frame it receives.
  *
- * Run under wine by test/selftest.sh, with CANSHIM_* env pointing at cannelloni.
+ * Run under wine by test/selftest.sh, with KVASILLONI_* env pointing at cannelloni.
  *
  *   canshim_probe.exe <hex_id> <ext|std> <hex_data_bytes...>
  *   e.g.  canshim_probe.exe 0x18EEFF00 ext DE AD BE EF

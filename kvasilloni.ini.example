@@ -1,7 +1,7 @@
 ; kvasilloni.ini — configuration for the canlib32.dll cannelloni shim.
 ;
 ; Copy this file to "kvasilloni.ini" and place it next to canlib32.dll (or next
-; to your application's .exe). Values here are overridden by CANSHIM_* environment
+; to your application's .exe). Values here are overridden by KVASILLONI_* environment
 ; variables if those are set, so scripted/CI runs can still override the file.
 ;
 ; The [cannelloni] section header is optional.

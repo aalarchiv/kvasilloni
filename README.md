@@ -66,7 +66,7 @@ matches your Windows application's bitness (most legacy Kvaser apps are 32-bit).
 
 The shim is configured by an **INI file** — the Windows-native mechanism. It looks
 for `kvasilloni.ini` next to the DLL, then next to the application's .exe
-(`CANSHIM_INI` may give an explicit path). See `kvasilloni.ini.example`:
+(`KVASILLONI_INI` may give an explicit path). See `kvasilloni.ini.example`:
 
 ```ini
 [cannelloni]
@@ -84,13 +84,13 @@ precedence over the INI (handy for scripting/CI). Precedence is
 
 | Variable            | INI key     | Default     | Meaning                              |
 |---------------------|-------------|-------------|--------------------------------------|
-| `CANSHIM_HOST`      | `host`      | `127.0.0.1` | Linux host running cannelloni        |
-| `CANSHIM_PORT`      | `port`      | `20000`     | Remote port the shim sends to        |
-| `CANSHIM_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port     |
-| `CANSHIM_PROTO`     | `proto`     | `udp`       | `udp` or `tcp`                       |
-| `CANSHIM_TCPROLE`   | `tcprole`   | `client`    | `client` or `server` (TCP only)      |
-| `CANSHIM_LOG`       | `log`       | (unset)     | If set, append a debug log here      |
-| `CANSHIM_INI`       | —           | (auto)      | Explicit path to the INI file        |
+| `KVASILLONI_HOST`      | `host`      | `127.0.0.1` | Linux host running cannelloni        |
+| `KVASILLONI_PORT`      | `port`      | `20000`     | Remote port the shim sends to        |
+| `KVASILLONI_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port     |
+| `KVASILLONI_PROTO`     | `proto`     | `udp`       | `udp` or `tcp`                       |
+| `KVASILLONI_TCPROLE`   | `tcprole`   | `client`    | `client` or `server` (TCP only)      |
+| `KVASILLONI_LOG`       | `log`       | (unset)     | If set, append a debug log here      |
+| `KVASILLONI_INI`       | —           | (auto)      | Explicit path to the INI file        |
 
 ## Linux side (cannelloni)
 
@@ -106,17 +106,17 @@ sudo ip link set up vcan0
 remote). Replace `<win-ip>` with the Windows VM's address:
 
 ```bash
-cannelloni -I vcan0 -R <win-ip> -r <CANSHIM_LOCALPORT> -l <CANSHIM_PORT>
-# matching shim env: CANSHIM_PROTO=udp CANSHIM_HOST=<linux-ip>
-#                    CANSHIM_PORT=<l-port> CANSHIM_LOCALPORT=<r-port>
+cannelloni -I vcan0 -R <win-ip> -r <KVASILLONI_LOCALPORT> -l <KVASILLONI_PORT>
+# matching shim env: KVASILLONI_PROTO=udp KVASILLONI_HOST=<linux-ip>
+#                    KVASILLONI_PORT=<l-port> KVASILLONI_LOCALPORT=<r-port>
 ```
 
 **TCP** with the shim as client (recommended TCP setup):
 
 ```bash
-cannelloni -C s -R <win-ip> -I vcan0 -l <CANSHIM_PORT>
-# matching shim env: CANSHIM_PROTO=tcp CANSHIM_TCPROLE=client
-#                    CANSHIM_HOST=<linux-ip> CANSHIM_PORT=<port>
+cannelloni -C s -R <win-ip> -I vcan0 -l <KVASILLONI_PORT>
+# matching shim env: KVASILLONI_PROTO=tcp KVASILLONI_TCPROLE=client
+#                    KVASILLONI_HOST=<linux-ip> KVASILLONI_PORT=<port>
 ```
 
 > cannelloni's TCP/UDP server checks the peer IP against `-R` by default. Set
