@@ -1,0 +1,88 @@
+name: release
+
+# Build the Windows DLLs and publish a GitHub release ONLY when a version tag
+# is pushed (e.g. v0.2.0). No build runs on ordinary branch pushes.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed to create the release and upload assets
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }} (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: i686-pc-windows-gnu
+            arch: x86      # 32-bit (most legacy Kvaser apps)
+          - target: x86_64-pc-windows-gnu
+            arch: x64      # 64-bit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mingw-w64 cross linkers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release DLL
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/canlib32.dll" \
+             "dist/canlib32-${{ matrix.arch }}.dll"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dll-${{ matrix.arch }}
+          path: dist/canlib32-${{ matrix.arch }}.dll
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built DLLs
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets and compute checksums
+        run: |
+          mkdir -p release
+          find artifacts -name '*.dll' -exec cp {} release/ \;
+          cd release
+          sha256sum *.dll > SHA256SUMS.txt
+          echo "== SHA256SUMS.txt =="
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/canlib32-x86.dll
+            release/canlib32-x64.dll
+            release/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Drop-in Kvaser `canlib32.dll` cannelloni shim.
+
+            | Asset | Use for |
+            |---|---|
+            | `canlib32-x86.dll` | 32-bit Windows apps (most legacy Kvaser apps) |
+            | `canlib32-x64.dll` | 64-bit Windows apps |
+
+            Rename the matching file to `canlib32.dll` and drop it next to your
+            application's executable. Verify with `sha256sum -c SHA256SUMS.txt`
+            (after renaming the files back to the names listed there).
