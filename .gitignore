@@ -9,6 +9,3 @@ refs/
 
 # Rust / cargo build output
 /target/
-
-# C prototype build output
-/reference/c-prototype/build/

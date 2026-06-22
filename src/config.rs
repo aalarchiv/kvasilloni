@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Layered configuration: built-in defaults < `kvasilloni.ini` < environment.
 //!
 //! The INI file is the Windows-native mechanism (drop it next to the DLL or next

@@ -1,13 +1,13 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! canlib32.dll — a drop-in Kvaser CANlib shim that bridges to a Linux `vcan`
 //! via cannelloni (UDP or TCP), with no Kvaser hardware or driver.
 //!
-//! Implements the 13 symbols the target Windows app resolves (see the reference
-//! DLL export table in `refs/canlib32.dll`), plus an extended set of CANlib
-//! functions for retargeting to other apps (epic kvasilloni-5yp): queue
-//! flushing, bus-output control, blocking I/O, `canIoCtl`, acceptance
-//! filtering, channel enumeration, and event notifications. Instead of touching
-//! hardware, the shim is itself a cannelloni peer talking to a stock
-//! `cannelloni -I vcan0 ...` on the Linux side.
+//! Implements the 13 CANlib symbols the target Windows app resolves, plus an
+//! extended set of CANlib functions for retargeting to other apps (epic
+//! kvasilloni-5yp): queue flushing, bus-output control, blocking I/O,
+//! `canIoCtl`, acceptance filtering, channel enumeration, and event
+//! notifications. Instead of touching hardware, the shim is itself a cannelloni
+//! peer talking to a stock `cannelloni -I vcan0 ...` on the Linux side.
 //!
 //!   Windows app -> canlib32.dll (this) --UDP|TCP--> cannelloni -> vcan -> Linux CAN
 //!
@@ -35,7 +35,7 @@ use config::Config;
 use transport::Conn;
 use wire::Frame;
 
-// ---- CANlib return codes (refs/kvaser_canlib/canstat.h) ----
+// ---- CANlib return codes ----
 const CAN_OK: c_int = 0;
 const CAN_ERR_PARAM: c_int = -1;
 const CAN_ERR_NOMSG: c_int = -2;

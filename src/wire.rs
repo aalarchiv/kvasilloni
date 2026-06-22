@@ -1,19 +1,19 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! cannelloni wire-format codec + Kvaser <-> SocketCAN id translation.
 //!
-//! Mirrors `refs/cannelloni/parser.cpp` (UDP, packet-framed) and
-//! `refs/cannelloni/decoder.cpp` (TCP, headerless streaming) byte-for-byte so
-//! the shim interoperates with a stock cannelloni peer. The C prototype's
-//! equivalent (`reference/c-prototype/src/cannelloni_wire.c`) is cross-validated
-//! against cannelloni's own sources by `reference/c-prototype` `make test`; the
-//! Rust port is checked against golden byte vectors in the tests below.
+//! An independent implementation of the cannelloni wire protocol — UDP
+//! (packet-framed) and TCP (headerless streaming) — so the shim interoperates
+//! as a cannelloni peer. It reproduces only the on-the-wire byte layout needed
+//! for that interop and is verified against golden byte vectors in the tests
+//! below.
 
-// ---- cannelloni protocol constants (refs/cannelloni/cannelloni.h, decoder.h) ----
+// ---- cannelloni protocol constants ----
 pub const FRAME_VERSION: u8 = 2; // CANNELLONI_FRAME_VERSION
 pub const OP_DATA: u8 = 0; // op_codes::DATA
 pub const DATA_PACKET_BASE_SIZE: usize = 5; // version+op+seq+count(2)
 pub const FRAME_BASE_SIZE: usize = 5; // can_id(4)+len(1)
 pub const CANFD_FRAME: u8 = 0x80; // high bit of len => CAN FD
-pub const CONNECT_V1: &[u8] = b"CANNELLONIv1"; // TCP handshake (tcpthread.h)
+pub const CONNECT_V1: &[u8] = b"CANNELLONIv1"; // TCP handshake banner
 
 // ---- SocketCAN can_id flag bits (linux/can.h) ----
 pub const CAN_EFF_FLAG: u32 = 0x8000_0000;
@@ -21,7 +21,7 @@ pub const CAN_RTR_FLAG: u32 = 0x4000_0000;
 pub const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
 pub const CAN_SFF_MASK: u32 = 0x0000_07FF;
 
-// ---- Kvaser canMSG_* / canFDMSG_* flags (refs/pycanlib enums.py MessageFlag) ----
+// ---- Kvaser canMSG_* / canFDMSG_* message flags ----
 pub const CAN_MSG_RTR: u32 = 0x0001;
 pub const CAN_MSG_STD: u32 = 0x0002;
 pub const CAN_MSG_EXT: u32 = 0x0004;
@@ -127,7 +127,7 @@ pub fn canid_to_kvaser(can_id: u32, fd: bool) -> (i32, u32) {
 
 // ============================ per-frame codec ==============================
 
-/// Encode one frame (cannelloni `encodeFrame`). Appends to `out`.
+/// Encode one frame in cannelloni wire format. Appends to `out`.
 pub fn encode_frame(out: &mut Vec<u8>, f: &Frame) {
     let mut len = f.len & 0x7F;
     if f.fd {
@@ -144,7 +144,7 @@ pub fn encode_frame(out: &mut Vec<u8>, f: &Frame) {
     }
 }
 
-/// Streaming TCP decoder, mirroring `decoder.cpp::decodeFrame`.
+/// Streaming TCP decoder for the headerless cannelloni frame stream.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecodeState {
     Init,
@@ -164,9 +164,9 @@ pub enum Decoded {
     Error,
 }
 
-/// Drive exactly like cannelloni's read loop: start in `Init`, call with an
-/// empty slice to learn the first read size, then feed precisely the requested
-/// number of bytes each step.
+/// Drive the streaming decoder: start in `Init`, call with an empty slice to
+/// learn the first read size, then feed precisely the requested number of bytes
+/// each step.
 pub fn decode_stream(data: &[u8], f: &mut Frame, state: &mut DecodeState) -> Decoded {
     match *state {
         DecodeState::Init => {

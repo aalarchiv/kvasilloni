@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Network transport: makes the shim a cannelloni peer over UDP or TCP.
 //!
 //! One channel = one [`Conn`]. A background RX thread decodes inbound cannelloni

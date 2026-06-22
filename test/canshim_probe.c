@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /*
  * canshim_probe.exe — the Windows-side actor for the end-to-end selftest.
  *

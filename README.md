@@ -219,8 +219,8 @@ make selftest
 
 - **`src/wire.rs`** — the cannelloni codec: per-frame `encode`/`decode`, the
   UDP packet builder/parser, the TCP streaming decoder state machine, and the
-  Kvaser↔SocketCAN ID/flag translation. Mirrors `refs/cannelloni`
-  (`parser.cpp`, `decoder.cpp`) byte-for-byte. Unit-tested against golden vectors.
+  Kvaser↔SocketCAN ID/flag translation. An independent implementation of the
+  cannelloni wire protocol, unit-tested against golden byte vectors.
 - **`src/transport.rs`** — UDP and TCP (client/server) transports with a
   background RX thread feeding a bounded ring; `canWrite` sends one frame,
   `canRead` drains the ring (`canERR_NOMSG` when empty).
@@ -239,9 +239,16 @@ Per frame: `can_id` (4 bytes, big-endian, SocketCAN flag bits in the top —
 and packs `count` frames. **TCP** opens with both peers exchanging the ASCII
 string `CANNELLONIv1`, then streams frames back-to-back with no packet header.
 
-## Reference C prototype
+## License
 
-`reference/c-prototype/` holds the original C implementation of the same shim. Its
-`make test` cross-validates the wire codec against cannelloni's *own*
-`parser.cpp`/`decoder.cpp` compiled natively — a useful independent oracle of the
-wire format. The Rust crate is the maintained deliverable.
+Licensed under the **GNU Lesser General Public License v3.0 or later**
+(LGPL-3.0-or-later). See [`COPYING.LESSER`](COPYING.LESSER) (which extends the
+GPLv3 in [`COPYING`](COPYING)).
+
+The shim contains no Kvaser or cannelloni source: it is an independent
+implementation that emulates the CANlib export interface and speaks the
+cannelloni wire protocol over the network to interoperate with a stock,
+separately-running `cannelloni` process. LGPL was chosen because the DLL is
+designed to be loaded by other applications (including proprietary ones) as a
+drop-in replacement — the library itself stays open and user-replaceable, while
+the programs that load it are unaffected.

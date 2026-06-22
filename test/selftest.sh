@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # End-to-end selftest for the Rust canlib32 cannelloni shim, on a single host:
 #
 #   canshim_probe.exe (wine) --[canlib32.dll shim]--> cannelloni <--> vcan1 <--> candump/cansend
@@ -46,13 +47,20 @@ i686-w64-mingw32-gcc -O2 -Wall "$ROOT/test/canshim_probe.c" -o "$BUILD/canshim_p
   || skip "probe build failed"
 cp -f "$DLL" "$BUILD/canlib32.dll"
 
-# build cannelloni if needed
-CANNBIN="$CANN/build/cannelloni"
-if [ ! -x "$CANNBIN" ]; then
-  need cmake
-  echo "== building cannelloni =="
-  cmake -S "$CANN" -B "$CANN/build" -DCMAKE_BUILD_TYPE=Release -DSCTP_SUPPORT=OFF >/dev/null 2>&1 \
-    && cmake --build "$CANN/build" -j >/dev/null 2>&1 || skip "cannelloni build failed"
+# Locate cannelloni: prefer one already installed on PATH; otherwise build from
+# a local source checkout at $CANN (override with CANNELLONI_SRC) if present.
+CANN="${CANNELLONI_SRC:-$CANN}"
+if command -v cannelloni >/dev/null 2>&1; then
+  CANNBIN="$(command -v cannelloni)"
+else
+  CANNBIN="$CANN/build/cannelloni"
+  if [ ! -x "$CANNBIN" ]; then
+    [ -d "$CANN" ] || skip "cannelloni not on PATH and no source at $CANN (set CANNELLONI_SRC)"
+    need cmake
+    echo "== building cannelloni from $CANN =="
+    cmake -S "$CANN" -B "$CANN/build" -DCMAKE_BUILD_TYPE=Release -DSCTP_SUPPORT=OFF >/dev/null 2>&1 \
+      && cmake --build "$CANN/build" -j >/dev/null 2>&1 || skip "cannelloni build failed"
+  fi
 fi
 [ -x "$CANNBIN" ] || skip "cannelloni binary not found"
 
