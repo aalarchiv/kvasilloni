@@ -10,11 +10,11 @@ the Kvaser CANlib API) needs to talk to CAN software bound to a **virtual CAN bu
 on a separate Linux host**.
 
 ```
- Windows 11 VM                                    Linux host
-┌──────────────────────────┐                    ┌───────────────────────────┐
-│ CAN application           │   cannelloni       │ cannelloni -I vcan0 ...    │
-│  └ canlib32.dll  (SHIM) ──┼── UDP or TCP ──────┼─▶ vcan0 ◀─▶ your CAN code  │
-└──────────────────────────┘   (LAN / host link) └───────────────────────────┘
+ Windows 11 VM                                       Linux host
+┌───────────────────────────┐                      ┌───────────────────────────┐
+│ CAN application           │      cannelloni      │ cannelloni -I vcan0 ...   │
+│  canlib32.dll  (SHIM)     ┼────── UDP/TCP ───────┼ vcan0  <->  your CAN code │
+└───────────────────────────┘  (LAN / host link)   └───────────────────────────┘
 ```
 
 Instead of touching hardware, the shim **is itself a cannelloni peer**: it speaks
