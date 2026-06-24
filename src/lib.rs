@@ -101,6 +101,9 @@ pub extern "system" fn canOpenChannel(channel: c_int, flags: c_int) -> c_int {
             }
             Err(e) => {
                 log(&format!("canOpenChannel: connect failed: {e}"));
+                if cfg.tcp {
+                    log("canOpenChannel: hint: cannelloni -p or -R <peer-ip> skips peer check");
+                }
                 CAN_ERR_NOTFOUND
             }
         }
