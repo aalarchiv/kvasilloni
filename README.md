@@ -142,7 +142,7 @@ for `kvasilloni.ini` next to the DLL, then next to the application's .exe
 [cannelloni]
 host      = 192.168.1.50   ; Linux host running cannelloni
 port      = 20000          ; remote port the shim sends to (cannelloni's -l)
-localport = 20000          ; local UDP bind / TCP server port (cannelloni's -r)
+localport = 20000          ; local UDP bind / TCP server port (cannelloni's -r); unique per app in UDP mode
 proto     = udp            ; udp | tcp
 tcprole   = client         ; client | server  (tcp only)
 ; log     = C:\temp\kvasilloni.log
@@ -156,7 +156,7 @@ precedence over the INI (handy for scripting/CI). Precedence is
 |---------------------|-------------|-------------|--------------------------------------|
 | `KVASILLONI_HOST`      | `host`      | `127.0.0.1` | Linux host running cannelloni        |
 | `KVASILLONI_PORT`      | `port`      | `20000`     | Remote port the shim sends to        |
-| `KVASILLONI_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port     |
+| `KVASILLONI_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port; each app needs a unique value in UDP mode (TCP client picks an ephemeral port and ignores this) |
 | `KVASILLONI_PROTO`     | `proto`     | `udp`       | `udp` or `tcp`                       |
 | `KVASILLONI_TCPROLE`   | `tcprole`   | `client`    | `client` or `server` (TCP only)      |
 | `KVASILLONI_LOG`       | `log`       | (unset)     | If set, append a debug log here      |
