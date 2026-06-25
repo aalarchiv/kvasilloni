@@ -16,6 +16,8 @@ port = 20000
 
 ; Local port the shim binds (UDP) or listens on (TCP server).
 ; For UDP this is cannelloni's -r remote port.
+; UDP only: each app running simultaneously needs a unique localport value.
+; TCP client mode ignores this setting (the OS picks an ephemeral port).
 localport = 20000
 
 ; Transport: udp (default, simplest) or tcp (reliable, ordered).

@@ -10,7 +10,7 @@
 //! [cannelloni]
 //! host      = 192.168.1.50
 //! port      = 20000
-//! localport = 20000
+//! localport = 20000        ; UDP only: must be unique per app running simultaneously
 //! proto     = udp        ; udp | tcp
 //! tcprole   = client     ; client | server  (tcp only)
 //! log       = C:\temp\kvasilloni.log
