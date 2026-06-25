@@ -15,6 +15,12 @@ pub const FRAME_BASE_SIZE: usize = 5; // can_id(4)+len(1)
 pub const CANFD_FRAME: u8 = 0x80; // high bit of len => CAN FD
 pub const CONNECT_V1: &[u8] = b"CANNELLONIv1"; // TCP handshake banner
 
+/// Maximum data bytes a [`Frame`] can hold (CAN FD payload). The wire length
+/// field is 7 bits (0..=127), so a malformed/hostile peer can encode more than
+/// this; both decoders MUST reject anything larger rather than index past
+/// `Frame.data`. See kvasilloni-kkt.
+pub const MAX_FRAME_LEN: usize = 64;
+
 // ---- SocketCAN can_id flag bits (linux/can.h) ----
 pub const CAN_EFF_FLAG: u32 = 0x8000_0000;
 pub const CAN_RTR_FLAG: u32 = 0x4000_0000;
@@ -190,6 +196,9 @@ pub fn decode_stream(data: &[u8], f: &mut Frame, state: &mut DecodeState) -> Dec
             if raw & CANFD_FRAME != 0 {
                 f.fd = true;
                 f.len = raw & !CANFD_FRAME;
+                if f.len as usize > MAX_FRAME_LEN {
+                    return Decoded::Error; // would overrun Frame.data (kvasilloni-kkt)
+                }
                 *state = DecodeState::Flags;
                 return Decoded::Need(1);
             }
@@ -203,6 +212,9 @@ pub fn decode_stream(data: &[u8], f: &mut Frame, state: &mut DecodeState) -> Dec
             if f.len == 0 {
                 *state = DecodeState::Init;
                 return Decoded::Complete;
+            }
+            if f.len as usize > MAX_FRAME_LEN {
+                return Decoded::Error; // would overrun Frame.data (kvasilloni-kkt)
             }
             *state = DecodeState::Data;
             Decoded::Need(f.len as usize)
@@ -221,7 +233,9 @@ pub fn decode_stream(data: &[u8], f: &mut Frame, state: &mut DecodeState) -> Dec
         }
         DecodeState::Data => {
             let n = f.len as usize;
-            if data.len() != n {
+            // `n > Frame.data` can only happen if the length guards above were
+            // bypassed; keep the copy site itself unconditionally in-bounds.
+            if data.len() != n || n > f.data.len() {
                 return Decoded::Error;
             }
             f.data[..n].copy_from_slice(&data[..n]);
@@ -277,6 +291,9 @@ pub fn parse_udp(buf: &[u8]) -> Option<Vec<Frame>> {
             f.len = raw;
         }
         let dlen = (f.len & 0x7F) as usize;
+        if dlen > MAX_FRAME_LEN {
+            return None; // would overrun Frame.data (kvasilloni-kkt)
+        }
         if !f.is_rtr() {
             if p + dlen > buf.len() {
                 return None;
@@ -436,6 +453,46 @@ mod tests {
         assert_eq!(kvaser_to_fd_flags(CAN_MSG_BRS | CAN_MSG_ESI), CANFD_BRS | CANFD_ESI);
         assert_eq!(fd_flags_to_kvaser(CANFD_BRS), CAN_MSG_BRS);
         assert_eq!(fd_flags_to_kvaser(CANFD_ESI), CAN_MSG_ESI);
+    }
+
+    #[test]
+    fn parse_udp_rejects_overlong_len_without_panic() {
+        // Classic frame claiming 100 data bytes (> 64) must be rejected as None,
+        // not panic indexing Frame.data. Regression for kvasilloni-kkt.
+        let mut pkt = vec![0x02, 0x00, 0x00, 0x00, 0x01]; // ver, DATA, seq, count=1
+        pkt.extend_from_slice(&[0x00, 0x00, 0x01, 0x23]); // can_id 0x123
+        pkt.push(100); // len = 100, no FD bit
+        pkt.extend(std::iter::repeat(0xAB).take(100));
+        assert!(parse_udp(&pkt).is_none());
+
+        // FD frame claiming 100 bytes (len byte 0x80|100) is likewise rejected.
+        let mut fd = vec![0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00];
+        fd.push(CANFD_FRAME | 100); // FD + len 100
+        fd.push(0x00); // fd_flags
+        fd.extend(std::iter::repeat(0xCD).take(100));
+        assert!(parse_udp(&fd).is_none());
+
+        // A valid 8-byte frame in the same shape still parses (guard isn't too tight).
+        let ok = build_udp(&mk(0x123, &[1, 2, 3, 4, 5, 6, 7, 8]), 0);
+        assert_eq!(parse_udp(&ok).unwrap()[0].len, 8);
+    }
+
+    #[test]
+    fn decode_stream_rejects_overlong_len_without_panic() {
+        // Classic len=70 (>64): Len state must return Error, never reach a Data
+        // copy that overruns Frame.data. Regression for kvasilloni-kkt.
+        let mut f = Frame::default();
+        let mut st = DecodeState::Init;
+        let _ = decode_stream(&[], &mut f, &mut st); // -> Need(4)
+        let _ = decode_stream(&[0, 0, 1, 0x23], &mut f, &mut st); // -> Need(1)
+        assert!(matches!(decode_stream(&[70], &mut f, &mut st), Decoded::Error));
+
+        // FD len=70 (>64): rejected at the Len state, before requesting flags.
+        let mut f2 = Frame::default();
+        let mut st2 = DecodeState::Init;
+        let _ = decode_stream(&[], &mut f2, &mut st2);
+        let _ = decode_stream(&[0, 0, 1, 0x23], &mut f2, &mut st2);
+        assert!(matches!(decode_stream(&[CANFD_FRAME | 70], &mut f2, &mut st2), Decoded::Error));
     }
 
     #[test]

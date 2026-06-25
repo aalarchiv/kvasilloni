@@ -5,6 +5,13 @@
 //! to the application's .exe). Environment variables still override it so the
 //! selftest and scripted runs keep working.
 //!
+//! Path note: the INI is auto-discovered relative to the DLL/EXE *module*
+//! location, so it works regardless of the host's current working directory.
+//! But a value you put in `log=` (or the `KVASILLONI_INI` env var) is opened
+//! verbatim: a relative path resolves against the host process's CWD - often
+//! `C:\Windows\System32` for a service - not the folder you dropped files in.
+//! Always use ABSOLUTE paths for `log=` and `KVASILLONI_INI`.
+//!
 //! `kvasilloni.ini` (a `[cannelloni]` section header is optional):
 //! ```ini
 //! [cannelloni]

@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::raw::{c_int, c_long, c_ulong};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -75,6 +76,9 @@ struct Notify {
 pub struct Shared {
     q: Mutex<VecDeque<Frame>>,
     cv: Condvar,
+    /// Set by `close()` so blocked readers (`canReadWait`/`canReadSync`) wake and
+    /// return instead of parking until their timeout (kvasilloni-hc9).
+    closed: AtomicBool,
     filters: Mutex<Accept>,
     notify: Mutex<Notify>,
 }
@@ -84,6 +88,7 @@ impl Shared {
         Arc::new(Shared {
             q: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
+            closed: AtomicBool::new(false),
             filters: Mutex::new(Accept::default()),
             notify: Mutex::new(Notify::default()),
         })
@@ -127,24 +132,42 @@ impl Shared {
     }
 
     /// Block up to `timeout` for a frame, then pop it (backs `canReadWait`).
+    /// Returns early (with whatever is queued, usually `None`) once `close()`
+    /// marks the connection closed, so teardown never strands a reader.
     pub fn pop_wait(&self, timeout: Duration) -> Option<Frame> {
         let q = self.q.lock().unwrap_or_else(|e| e.into_inner());
         let (mut q, _) = self
             .cv
-            .wait_timeout_while(q, timeout, |q| q.is_empty())
+            .wait_timeout_while(q, timeout, |q| {
+                q.is_empty() && !self.closed.load(Ordering::SeqCst)
+            })
             .unwrap_or_else(|e| e.into_inner());
         q.pop_front()
     }
 
     /// Block up to `timeout` until a frame is available, without removing it
-    /// (backs `canReadSync`). Returns true if one is available.
+    /// (backs `canReadSync`). Returns true if one is available. Also returns
+    /// (false, if empty) promptly once the connection is closed.
     pub fn peek_wait(&self, timeout: Duration) -> bool {
         let q = self.q.lock().unwrap_or_else(|e| e.into_inner());
         let (q, _) = self
             .cv
-            .wait_timeout_while(q, timeout, |q| q.is_empty())
+            .wait_timeout_while(q, timeout, |q| {
+                q.is_empty() && !self.closed.load(Ordering::SeqCst)
+            })
             .unwrap_or_else(|e| e.into_inner());
         !q.is_empty()
+    }
+
+    /// Mark the connection closed and wake every blocked reader. The flag is set
+    /// under the `q` lock so a reader cannot park between checking the predicate
+    /// and the wakeup (no lost-wakeup race). See kvasilloni-hc9.
+    pub fn mark_closed(&self) {
+        {
+            let _g = self.q.lock().unwrap_or_else(|e| e.into_inner());
+            self.closed.store(true, Ordering::SeqCst);
+        }
+        self.cv.notify_all();
     }
 
     /// Drop all queued frames (backs `canFlushReceiveQueue`).
@@ -187,6 +210,23 @@ pub struct Conn {
     negotiated: Arc<AtomicBool>,
     rx_sock: RxStop,
     handle: Option<JoinHandle<()>>,
+    /// Actual bound local port. For UDP this may differ from the configured
+    /// `local_port` if that was busy and we fell back to ephemeral (kvasilloni-iai).
+    local_port: u16,
+}
+
+/// Bind a UDP socket on `local_port`, falling back to an OS-assigned ephemeral
+/// port if the requested one is already in use (e.g. a second instance of the
+/// same app). The cannelloni peer learns our address from the datagrams we send
+/// it (or is told via `-R`/`-p`), so a different source port still works.
+fn bind_udp(local_port: u16) -> std::io::Result<UdpSocket> {
+    match UdpSocket::bind(("0.0.0.0", local_port)) {
+        Ok(s) => Ok(s),
+        Err(ref e) if local_port != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+            UdpSocket::bind(("0.0.0.0", 0))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Handle used by `close` to unblock the RX thread. The UDP variant is never
@@ -209,7 +249,8 @@ impl Conn {
 
         if !cfg.tcp {
             // -------------------------------- UDP --------------------------------
-            let sock = UdpSocket::bind(("0.0.0.0", cfg.local_port))?;
+            let sock = bind_udp(cfg.local_port)?;
+            let local_port = sock.local_addr().map(|a| a.port()).unwrap_or(cfg.local_port);
             let tx_sock = sock.try_clone()?;
             let rx_sock = sock.try_clone()?;
             rx_sock.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -224,6 +265,7 @@ impl Conn {
                 negotiated,
                 rx_sock: RxStop::Udp(sock), // original handle, used to stop the loop
                 handle: Some(handle),
+                local_port,
             });
         }
 
@@ -243,6 +285,7 @@ impl Conn {
         handshake(&stream)?;
         negotiated.store(true, Ordering::SeqCst);
 
+        let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(cfg.local_port);
         let rx_stream = stream.try_clone()?;
         let tx_stream = stream.try_clone()?;
         let stop_stream = stream;
@@ -257,7 +300,14 @@ impl Conn {
             negotiated,
             rx_sock: RxStop::Tcp(stop_stream),
             handle: Some(handle),
+            local_port,
         })
+    }
+
+    /// Actual bound local port (UDP may differ from the configured one after an
+    /// ephemeral fallback; kvasilloni-iai). Used by `canOpenChannel` logging.
+    pub fn local_port(&self) -> u16 {
+        self.local_port
     }
 
     pub fn is_ready(&self) -> bool {
@@ -323,6 +373,7 @@ impl Conn {
     pub fn close(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         self.negotiated.store(false, Ordering::SeqCst);
+        self.shared.mark_closed(); // wake blocked canReadWait/canReadSync (kvasilloni-hc9)
         match &self.rx_sock {
             RxStop::Tcp(s) => {
                 let _ = s.shutdown(Shutdown::Both);
@@ -330,7 +381,16 @@ impl Conn {
             RxStop::Udp(_) => { /* the 500ms read timeout lets the loop exit */ }
         }
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            // If close() runs ON the RX thread itself - e.g. an app's
+            // canSetNotify callback (which fires on the RX thread) calls
+            // canClose - then joining would deadlock the thread on itself.
+            // Detach instead: running=false plus the socket shutdown make the
+            // loop exit once the callback returns. See kvasilloni-cqe.
+            if h.thread().id() == std::thread::current().id() {
+                // running on the RX thread: detach, do not join
+            } else {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -379,11 +439,18 @@ fn udp_rx_loop(sock: UdpSocket, rx: Arc<Shared>, running: Arc<AtomicBool>) {
     while running.load(Ordering::SeqCst) {
         match sock.recv_from(&mut buf) {
             Ok((n, _from)) => {
-                if let Some(frames) = wire::parse_udp(&buf[..n]) {
-                    for f in frames {
-                        rx.push(f);
+                // Contain any panic in the decode/enqueue path so a single bad
+                // datagram can never kill the RX thread (kvasilloni-uzk). A panic
+                // *inside* the app's extern "system" notify callback aborts at the
+                // FFI boundary by Rust's rules - that is the app's contract, not
+                // something we can or should resume from.
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    if let Some(frames) = wire::parse_udp(&buf[..n]) {
+                        for f in frames {
+                            rx.push(f);
+                        }
                     }
-                }
+                }));
             }
             Err(ref e)
                 if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
@@ -411,7 +478,11 @@ fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Shared>, running: Arc<AtomicBool>)
         if stream.read_exact(&mut chunk[..need]).is_err() {
             break; // peer closed or socket shut down by close()
         }
-        match wire::decode_stream(&chunk[..need], &mut f, &mut st) {
+        // Contain a decoder panic so a malformed stream can't kill RX
+        // (kvasilloni-uzk); decode_stream is the untrusted-parse surface.
+        let decoded = catch_unwind(AssertUnwindSafe(|| wire::decode_stream(&chunk[..need], &mut f, &mut st)))
+            .unwrap_or(Decoded::Error);
+        match decoded {
             Decoded::Need(n) => need = n,
             Decoded::Complete => {
                 rx.push(f);
@@ -497,6 +568,39 @@ mod tests {
         s.push(frame(0x55));
         assert!(s.peek_wait(Duration::from_millis(10)));
         assert_eq!(s.level(), 1); // not consumed
+    }
+
+    #[test]
+    fn mark_closed_wakes_blocked_pop_wait() {
+        // Regression for kvasilloni-hc9: a reader blocked with a long timeout
+        // must return promptly once the connection is marked closed, not park
+        // for the full duration.
+        let s = Shared::new();
+        let s2 = s.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            s2.mark_closed();
+        });
+        let start = std::time::Instant::now();
+        let got = s.pop_wait(Duration::from_secs(30)); // would hang ~30s without the fix
+        t.join().unwrap();
+        assert!(got.is_none());
+        assert!(start.elapsed() < Duration::from_secs(5), "pop_wait did not wake on close");
+    }
+
+    #[test]
+    fn mark_closed_wakes_blocked_peek_wait() {
+        let s = Shared::new();
+        let s2 = s.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            s2.mark_closed();
+        });
+        let start = std::time::Instant::now();
+        let ready = s.peek_wait(Duration::from_secs(30));
+        t.join().unwrap();
+        assert!(!ready);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     static NOTIFY_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

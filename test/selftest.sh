@@ -69,6 +69,9 @@ if ! ip link show "$VCAN" >/dev/null 2>&1; then
   $SUDO modprobe vcan 2>/dev/null
   $SUDO ip link add dev "$VCAN" type vcan 2>/dev/null || skip "cannot create $VCAN (need root/CAP_NET_ADMIN)"
 fi
+# CAN FD frames need an FD-capable MTU (CANFD_MTU=72); set it while the link is
+# down (a freshly added vcan is down) so the FD case can inject via cansend.
+$SUDO ip link set "$VCAN" mtu 72 2>/dev/null || true
 $SUDO ip link set up "$VCAN" 2>/dev/null || skip "cannot bring up $VCAN"
 echo "using isolated bus: $VCAN"
 

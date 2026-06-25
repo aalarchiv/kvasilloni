@@ -156,11 +156,11 @@ precedence over the INI (handy for scripting/CI). Precedence is
 |---------------------|-------------|-------------|--------------------------------------|
 | `KVASILLONI_HOST`      | `host`      | `127.0.0.1` | Linux host running cannelloni        |
 | `KVASILLONI_PORT`      | `port`      | `20000`     | Remote port the shim sends to        |
-| `KVASILLONI_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port; each app needs a unique value in UDP mode (TCP client picks an ephemeral port and ignores this) |
+| `KVASILLONI_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port; in UDP mode each app wants a unique value, but if the chosen port is busy the shim now auto-falls back to an ephemeral port (logged) so a second instance still opens. TCP client picks an ephemeral port and ignores this |
 | `KVASILLONI_PROTO`     | `proto`     | `udp`       | `udp` or `tcp`                       |
 | `KVASILLONI_TCPROLE`   | `tcprole`   | `client`    | `client` or `server` (TCP only)      |
-| `KVASILLONI_LOG`       | `log`       | (unset)     | If set, append a debug log here      |
-| `KVASILLONI_INI`       | -           | (auto)      | Explicit path to the INI file        |
+| `KVASILLONI_LOG`       | `log`       | (unset)     | If set, append a debug log here. **Use an absolute path** - a relative one resolves against the host process's working directory (often `C:\Windows\System32`), not the folder you dropped the DLL in |
+| `KVASILLONI_INI`       | -           | (auto)      | Explicit path to the INI file (**absolute**). The auto-discovery (next to the DLL, then the EXE) is CWD-independent; this override is not |
 
 ## Linux side (cannelloni)
 

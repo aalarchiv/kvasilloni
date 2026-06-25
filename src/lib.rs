@@ -96,6 +96,13 @@ pub extern "system" fn canOpenChannel(channel: c_int, flags: c_int) -> c_int {
         ));
         match Conn::connect(&cfg) {
             Ok(c) => {
+                let bound = c.local_port();
+                if bound != cfg.local_port {
+                    log(&format!(
+                        "canOpenChannel: local port {} busy; bound ephemeral {bound} (kvasilloni-iai)",
+                        cfg.local_port
+                    ));
+                }
                 *CONN.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
                 1 // fixed non-negative handle
             }
