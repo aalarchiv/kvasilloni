@@ -22,7 +22,13 @@
 //! tcprole   = client     ; client | server  (tcp only)
 //! log       = C:\temp\kvasilloni.log
 //! channels  = 1          ; advertised by canGetNumberOfChannels (retargeting)
+//! connecttimeout = 5000  ; tcp client connect timeout, ms (also bounds handshake)
+//! accepttimeout  = 30000 ; tcp server: how long to wait for a client, ms
 //! ```
+//!
+//! Note: `canOpenChannel` blocks the calling thread during TCP setup for up to
+//! `connecttimeout` (client) / `accepttimeout` (server). Open off any UI or
+//! watchdog thread, or lower the timeout, if a fast non-blocking open matters.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,6 +43,10 @@ pub struct Config {
     pub log: Option<String>,
     /// Number of channels advertised by `canGetNumberOfChannels` (retargeting).
     pub channels: u32,
+    /// TCP client connect timeout, milliseconds (also bounds the handshake read).
+    pub connect_timeout_ms: u32,
+    /// TCP server accept timeout, milliseconds (how long to wait for a client).
+    pub accept_timeout_ms: u32,
 }
 
 impl Default for Config {
@@ -49,6 +59,8 @@ impl Default for Config {
             tcp_server: false,
             log: None,
             channels: 1,
+            connect_timeout_ms: 5000,
+            accept_timeout_ms: 30000,
         }
     }
 }
@@ -88,6 +100,12 @@ impl Config {
         if let Some(v) = m.get("channels").and_then(|v| v.parse().ok()) {
             self.channels = v;
         }
+        if let Some(v) = m.get("connecttimeout").and_then(|v| v.parse().ok()) {
+            self.connect_timeout_ms = v;
+        }
+        if let Some(v) = m.get("accepttimeout").and_then(|v| v.parse().ok()) {
+            self.accept_timeout_ms = v;
+        }
     }
 
     fn apply_env(&mut self) {
@@ -114,6 +132,12 @@ impl Config {
         }
         if let Some(v) = e("KVASILLONI_CHANNELS").and_then(|v| v.parse().ok()) {
             self.channels = v;
+        }
+        if let Some(v) = e("KVASILLONI_CONNECT_TIMEOUT").and_then(|v| v.parse().ok()) {
+            self.connect_timeout_ms = v;
+        }
+        if let Some(v) = e("KVASILLONI_ACCEPT_TIMEOUT").and_then(|v| v.parse().ok()) {
+            self.accept_timeout_ms = v;
         }
     }
 }
@@ -268,5 +292,20 @@ mod tests {
         assert_eq!(cfg.remote_port, 21000);
         assert!(cfg.tcp);
         assert!(cfg.tcp_server);
+    }
+
+    #[test]
+    fn timeouts_default_and_parse() {
+        let cfg = Config::default();
+        assert_eq!(cfg.connect_timeout_ms, 5000);
+        assert_eq!(cfg.accept_timeout_ms, 30000);
+
+        let mut cfg = Config::default();
+        let mut m = HashMap::new();
+        m.insert("connecttimeout".into(), "1500".into());
+        m.insert("accepttimeout".into(), "8000".into());
+        cfg.apply_map(&m);
+        assert_eq!(cfg.connect_timeout_ms, 1500);
+        assert_eq!(cfg.accept_timeout_ms, 8000);
     }
 }

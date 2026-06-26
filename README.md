@@ -146,6 +146,8 @@ localport = 20000          ; local UDP bind / TCP server port (cannelloni's -r);
 proto     = udp            ; udp | tcp
 tcprole   = client         ; client | server  (tcp only)
 ; log     = C:\temp\kvasilloni.log
+; connecttimeout = 5000    ; tcp client connect timeout, ms (also bounds handshake)
+; accepttimeout  = 30000   ; tcp server: how long to wait for a client, ms
 ```
 
 Every setting can also be overridden by an **environment variable**, which takes
@@ -161,6 +163,13 @@ precedence over the INI (handy for scripting/CI). Precedence is
 | `KVASILLONI_TCPROLE`   | `tcprole`   | `client`    | `client` or `server` (TCP only)      |
 | `KVASILLONI_LOG`       | `log`       | (unset)     | If set, append a debug log here. **Use an absolute path** - a relative one resolves against the host process's working directory (often `C:\Windows\System32`), not the folder you dropped the DLL in |
 | `KVASILLONI_INI`       | -           | (auto)      | Explicit path to the INI file (**absolute**). The auto-discovery (next to the DLL, then the EXE) is CWD-independent; this override is not |
+| `KVASILLONI_CONNECT_TIMEOUT` | `connecttimeout` | `5000` | TCP client connect timeout in ms (also bounds the handshake read) |
+| `KVASILLONI_ACCEPT_TIMEOUT`  | `accepttimeout`  | `30000`| TCP server: how long to wait for a client, in ms |
+
+> Note: in TCP mode `canOpenChannel` **blocks the calling thread** during setup -
+> up to `connecttimeout` (client) or `accepttimeout` (server). Open the channel
+> off any UI/watchdog thread, or lower the timeout, if a fast non-blocking open
+> matters. UDP opens are non-blocking.
 
 ## Linux side (cannelloni)
 

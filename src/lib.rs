@@ -29,7 +29,7 @@ use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_ushort};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use config::Config;
@@ -63,16 +63,36 @@ static NEXT_HANDLE: AtomicI32 = AtomicI32::new(1);
 static LOG_PATH: Mutex<Option<String>> = Mutex::new(None);
 /// Last value passed to `canSetBusOutputControl`; returned by the getter.
 static DRIVER_TYPE: AtomicU32 = AtomicU32::new(CAN_DRIVER_NORMAL);
+/// Memoized channel count for `canGetNumberOfChannels` (read from config once).
+static ENUM_CHANNELS: OnceLock<u32> = OnceLock::new();
+
+/// Cached append handle for the log file, keyed by its resolved path, so that
+/// high-rate logging (every canWrite/canRead when KVASILLONI_LOG is set) doesn't
+/// reopen the file on every call. Reopened only when the path changes.
+static LOG_FILE: Mutex<Option<(String, std::fs::File)>> = Mutex::new(None);
 
 fn log(msg: &str) {
     let path = std::env::var("KVASILLONI_LOG")
         .ok()
         .or_else(|| LOG_PATH.lock().ok().and_then(|g| g.clone()));
-    if let Some(path) = path {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{msg}");
+    let path = match path {
+        Some(p) => p,
+        None => return,
+    };
+    use std::io::Write;
+    let mut guard = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    // (Re)open only when the cache is empty or the configured path changed.
+    if !matches!(guard.as_ref(), Some((p, _)) if *p == path) {
+        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => *guard = Some((path, f)),
+            Err(_) => {
+                *guard = None; // best-effort: drop cache, retry on next call
+                return;
+            }
         }
+    }
+    if let Some((_, f)) = guard.as_mut() {
+        let _ = writeln!(f, "{msg}");
     }
 }
 
@@ -567,7 +587,9 @@ pub extern "system" fn canObjBufSetFilter(
 #[no_mangle]
 pub extern "system" fn canGetNumberOfChannels(channel_count: *mut c_int) -> c_int {
     guard(|| {
-        let n = Config::load().channels as c_int;
+        // Channel count is static config; read the INI once and memoize so apps
+        // that poll this don't re-hit the disk every call.
+        let n = *ENUM_CHANNELS.get_or_init(|| Config::load().channels) as c_int;
         unsafe {
             if !channel_count.is_null() {
                 *channel_count = n;

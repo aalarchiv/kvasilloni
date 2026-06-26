@@ -26,10 +26,16 @@ pub const NOTIFY_RX: u32 = 0x0001;
 /// Event code passed to the notify callback for a received frame (canstat.h).
 const EVENT_RX: c_int = 32000; // canEVENT_RX
 
-/// Mirrors the RX-relevant prefix of Kvaser's `canNotifyData` (canlib.h). For a
-/// receive event the C app reads `info.rx.id` / `info.rx.time`, which sit at the
-/// same offsets as `id` / `time` here (the union's first member). Layout matches
-/// the 32-bit target: pointer/long/ulong are all 4 bytes.
+/// Mirrors Kvaser's `canNotifyData` (canlib.h) for a receive event. Verified
+/// against the real header (Windows + Linux): the struct is
+/// `{ void* tag; int eventType; union { ...; struct { long id; unsigned long time; } rx; ... } info; }`.
+/// For an RX event the C app reads `info.rx.id` / `info.rx.time`; the union's
+/// `rx` member is just those two fields, so `id` / `time` here land exactly on
+/// them. On *both* Windows targets `c_long` / `c_ulong` are 32-bit, so the
+/// offsets and total size match (16 bytes on 32-bit, 24 on 64-bit). The
+/// `#[cfg(windows)]` assertion below locks that so a future field edit cannot
+/// silently break the ABI. (On the Linux host build `c_long` is 64-bit, hence
+/// the gate - the ABI only matters for the shipped Windows DLL.)
 #[repr(C)]
 struct NotifyData {
     tag: *mut c_void,
@@ -37,6 +43,18 @@ struct NotifyData {
     id: c_long,
     time: c_ulong,
 }
+
+#[cfg(windows)]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    // canNotifyData.info.rx = { long id; unsigned long time; }, 32-bit on Windows.
+    assert!(offset_of!(NotifyData, id) == size_of::<*const ()>() + 4);
+    assert!(offset_of!(NotifyData, time) == size_of::<*const ()>() + 8);
+    #[cfg(target_pointer_width = "32")]
+    assert!(size_of::<NotifyData>() == 16);
+    #[cfg(target_pointer_width = "64")]
+    assert!(size_of::<NotifyData>() == 24);
+};
 
 /// Acceptance filter state (set via `canAccept`). A frame passes when
 /// `(id & mask) == (code & mask)` for its id class; a zero mask accepts all,
@@ -270,19 +288,23 @@ impl Conn {
         }
 
         // ---------------------------------- TCP ----------------------------------
+        let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms as u64);
         let stream = if cfg.tcp_server {
             let listener = TcpListener::bind(("0.0.0.0", cfg.local_port))?;
             listener.set_nonblocking(false)?;
             // Block for a client, but not forever.
-            let (s, _peer) = accept_with_timeout(&listener, Duration::from_secs(30))?;
+            let (s, _peer) =
+                accept_with_timeout(&listener, Duration::from_millis(cfg.accept_timeout_ms as u64))?;
             s
         } else {
-            TcpStream::connect_timeout(&remote, Duration::from_secs(10))?
+            TcpStream::connect_timeout(&remote, connect_timeout)?
         };
         stream.set_nodelay(true).ok();
 
-        // Symmetric handshake: send + expect "CANNELLONIv1".
-        handshake(&stream)?;
+        // Symmetric handshake: send + expect "CANNELLONIv1", bounded by the
+        // connect timeout so a peer that connects but never sends the banner
+        // can't hang the open.
+        handshake(&stream, connect_timeout)?;
         negotiated.store(true, Ordering::SeqCst);
 
         let local_port = stream.local_addr().map(|a| a.port()).unwrap_or(cfg.local_port);
@@ -401,9 +423,9 @@ impl Drop for Conn {
     }
 }
 
-fn handshake(stream: &TcpStream) -> std::io::Result<()> {
+fn handshake(stream: &TcpStream, timeout: Duration) -> std::io::Result<()> {
     let mut s = stream.try_clone()?;
-    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    s.set_read_timeout(Some(timeout))?;
     s.write_all(wire::CONNECT_V1)?;
     let mut buf = [0u8; 12];
     s.read_exact(&mut buf)?;
@@ -635,5 +657,19 @@ mod tests {
         s.set_notify(test_cb as *const () as usize, 0 /* no NOTIFY_RX */, 0);
         s.push(frame(0x111));
         assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn notify_data_field_order() {
+        // The strict Windows offsets/size are checked at compile time by the
+        // #[cfg(windows)] const assertion next to NotifyData. Here, on the host
+        // build, assert the platform-independent invariant: `time` immediately
+        // follows `id` by one `c_long`, matching canNotifyData.info.rx layout.
+        use std::mem::offset_of;
+        assert!(offset_of!(NotifyData, time) > offset_of!(NotifyData, id));
+        assert_eq!(
+            offset_of!(NotifyData, time) - offset_of!(NotifyData, id),
+            std::mem::size_of::<c_long>()
+        );
     }
 }
