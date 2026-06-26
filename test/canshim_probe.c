@@ -256,7 +256,8 @@ static int run_notify(HMODULE dll, int argc, char **argv)
  * handles are distinct + non-negative, TX on both, and that the first channel
  * (bound to the configured local port cannelloni replies to) still receives.
  * Exercises the handle table (kvasilloni-j83) and the UDP ephemeral-port
- * fallback for the second open (kvasilloni-iai) together. */
+ * fallback for the second open (kvasilloni-iai / kvasilloni-25q). The harness
+ * sets KVASILLONI_UDP_PORT_FALLBACK=1, since the fallback is now opt-in. */
 static int run_multi(HMODULE dll, int argc, char **argv)
 {
     fn_init  p_init  = (fn_init) GetProcAddress(dll, "canInitializeLibrary");
@@ -273,7 +274,7 @@ static int run_multi(HMODULE dll, int argc, char **argv)
     if (!p_open || !p_write || !p_read) { fprintf(stderr, "PROBE: multi exports missing\n"); return 2; }
     if (p_init) p_init();
     ha = p_open(0, 0);
-    hb = p_open(1, 0);  /* second open: configured UDP port is busy -> ephemeral */
+    hb = p_open(1, 0);  /* port busy -> ephemeral (opt-in via env; kvasilloni-25q) */
     printf("PROBE: MULTI ha=%d hb=%d distinct=%d\n",
            ha, hb, (ha >= 0 && hb >= 0 && ha != hb) ? 1 : 0);
     fflush(stdout);

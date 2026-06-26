@@ -11,14 +11,21 @@
 //!
 //!   Windows app -> canlib32.dll (this) --UDP|TCP--> cannelloni -> vcan -> Linux CAN
 //!
-//! Config (environment, read at canOpenChannel):
-//!   KVASILLONI_HOST      Linux cannelloni IP        (default 127.0.0.1)
-//!   KVASILLONI_PORT      remote port to send to     (default 20000)
-//!   KVASILLONI_LOCALPORT UDP bind / TCP server port (default 20000)
-//!   KVASILLONI_PROTO     "udp" | "tcp"              (default "udp")
-//!   KVASILLONI_TCPROLE   "client" | "server"        (default "client")
-//!   KVASILLONI_LOG       path; if set, append a debug log
-//!   KVASILLONI_CHANNELS  channel count for canGetNumberOfChannels (default 1)
+//! Config is layered (defaults < `kvasilloni.ini` < environment), read fresh at
+//! each `canOpenChannel`; see `config.rs`. Every key has a `KVASILLONI_*` env
+//! override (host may be IPv4 or IPv6):
+//!   KVASILLONI_HOST            Linux cannelloni IP          (default 127.0.0.1)
+//!   KVASILLONI_PORT            remote port to send to       (default 20000)
+//!   KVASILLONI_LOCALPORT       UDP bind / TCP server port   (default 20000)
+//!   KVASILLONI_PROTO           "udp" | "tcp"                (default "udp")
+//!   KVASILLONI_TCPROLE         "client" | "server"          (default "client")
+//!   KVASILLONI_LOG             path; if set, append a debug log
+//!   KVASILLONI_CHANNELS        canGetNumberOfChannels count (default 1)
+//!   KVASILLONI_CONNECT_TIMEOUT TCP client connect/handshake timeout, ms (5000)
+//!   KVASILLONI_ACCEPT_TIMEOUT  TCP server accept timeout, ms          (30000)
+//!   KVASILLONI_PEER_CHECK      restrict inbound to host/allow (default on)
+//!   KVASILLONI_ALLOW           extra peer IPs (comma/space separated)
+//!   KVASILLONI_UDP_PORT_FALLBACK  bind ephemeral if localport busy (default off)
 
 mod config;
 mod transport;
@@ -29,7 +36,7 @@ use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_ushort};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use config::Config;
@@ -46,6 +53,20 @@ const CAN_ERR_NOT_IMPLEMENTED: c_int = -32;
 
 /// `canDRIVER_NORMAL` (canlib.h): default output-control driver type.
 const CAN_DRIVER_NORMAL: u32 = 4;
+
+// ---- canReadStatus flag bits (canstat.h) ----
+/// `canSTAT_RX_PENDING`: at least one frame is queued for reading.
+const CAN_STAT_RX_PENDING: c_ulong = 0x0000_0020;
+/// `canSTAT_SW_OVERRUN`: the driver dropped received frames (ring overflow).
+const CAN_STAT_SW_OVERRUN: c_ulong = 0x0000_0400;
+
+// ---- canGetChannelData CHANNEL_CAP bits (canlib.h canCHANNEL_CAP_*) ----
+/// The shim does classic+FD, extended IDs, on a virtual channel; advertise that
+/// so apps that gate CAN FD on the capability mask actually enable it. See
+/// kvasilloni-vsd.
+const CAN_CHANNEL_CAP_EXTENDED_CAN: u32 = 0x0000_0001;
+const CAN_CHANNEL_CAP_VIRTUAL: u32 = 0x0001_0000;
+const CAN_CHANNEL_CAP_CAN_FD: u32 = 0x0008_0000;
 /// `canWAIT_INFINITE` sentinel for the blocking-I/O timeout arguments (ms).
 const CAN_WAIT_INFINITE: c_ulong = 0xFFFF_FFFF;
 
@@ -55,7 +76,11 @@ const CAN_WAIT_INFINITE: c_ulong = 0xFFFF_FFFF;
 /// channels (e.g. one per thread) gets isolated connections instead of all
 /// sharing - or clobbering - one global. All channels still bridge to the same
 /// configured cannelloni endpoint. See kvasilloni-j83.
-static CONNS: Mutex<BTreeMap<c_int, Conn>> = Mutex::new(BTreeMap::new());
+/// `Arc<Conn>` so a call can clone its channel out of the map and then operate
+/// on it *without* holding the global lock - critical for `canWrite`, whose TCP
+/// send may block: holding `CONNS` across it would stall every other channel
+/// (kvasilloni-lo7). `Conn`'s methods all take `&self` (interior mutability).
+static CONNS: Mutex<BTreeMap<c_int, Arc<Conn>>> = Mutex::new(BTreeMap::new());
 /// Next handle to hand out. Kvaser handles are non-negative; we start at 1 and
 /// never reuse, so a stale handle from a closed channel fails lookup cleanly.
 static NEXT_HANDLE: AtomicI32 = AtomicI32::new(1);
@@ -155,7 +180,7 @@ pub extern "system" fn canOpenChannel(channel: c_int, flags: c_int) -> c_int {
                     ));
                 }
                 let hnd = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
-                CONNS.lock().unwrap_or_else(|e| e.into_inner()).insert(hnd, c);
+                CONNS.lock().unwrap_or_else(|e| e.into_inner()).insert(hnd, Arc::new(c));
                 log(&format!("canOpenChannel -> handle {hnd}"));
                 hnd // distinct non-negative handle per open channel
             }
@@ -163,6 +188,13 @@ pub extern "system" fn canOpenChannel(channel: c_int, flags: c_int) -> c_int {
                 log(&format!("canOpenChannel: connect failed: {e}"));
                 if cfg.tcp {
                     log("canOpenChannel: hint: cannelloni -p or -R <peer-ip> skips peer check");
+                } else {
+                    log(
+                        "canOpenChannel: hint: UDP localport may be in use; give each instance a \
+                         unique localport (and matching cannelloni -r). Set \
+                         KVASILLONI_UDP_PORT_FALLBACK=1 to bind an ephemeral port instead, but a \
+                         stock cannelloni then never sends to it (TX-only). See kvasilloni-25q.",
+                    );
                 }
                 CAN_ERR_NOTFOUND
             }
@@ -231,12 +263,14 @@ fn write_frame(hnd: c_int, id: c_long, msg: *mut c_void, dlc: c_uint, flag: c_ui
             let src = unsafe { std::slice::from_raw_parts(msg as *const u8, user_bytes) };
             f.data[..user_bytes].copy_from_slice(src);
         }
-        let guard = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-        let r = match guard.get(&hnd) {
-            Some(c) => c.write(&f),
+        // Clone the channel's Arc out of the map, then DROP the global lock before
+        // writing: a TCP send can block, and holding CONNS across it would stall
+        // every other channel (kvasilloni-lo7).
+        let conn = match CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd) {
+            Some(c) => c.clone(),
             None => return CAN_ERR_INVHANDLE,
         };
-        match r {
+        match conn.write(&f) {
             Ok(()) => {
                 log(&format!("canWrite id={id:#x} dlc={dlc} flag={flag:#x} -> ok"));
                 CAN_OK
@@ -259,13 +293,11 @@ pub extern "system" fn canRead(
     time: *mut c_ulong,
 ) -> c_int {
     guard(|| {
-        let frame = {
-            let g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-            match g.get(&hnd) {
-                Some(c) => c.read(),
-                None => return CAN_ERR_INVHANDLE,
-            }
+        let conn = match CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd) {
+            Some(c) => c.clone(),
+            None => return CAN_ERR_INVHANDLE,
         };
+        let frame = conn.read();
         let f = match frame {
             Some(f) => f,
             None => return CAN_ERR_NOMSG,
@@ -299,7 +331,7 @@ unsafe fn write_read_outputs(
         *dlc = f.len as c_uint;
     }
     if !time.is_null() {
-        *time = 0;
+        *time = f.rx_time_ms as c_ulong; // receive timestamp in ms (kvasilloni-kha)
     }
     if !msg.is_null() && f.len > 0 && !f.is_rtr() {
         let dst = std::slice::from_raw_parts_mut(msg as *mut u8, f.len as usize);
@@ -318,13 +350,28 @@ fn timeout_to_duration(timeout: c_ulong) -> Duration {
 }
 
 #[no_mangle]
-pub extern "system" fn canReadStatus(_hnd: c_int, flags: *mut c_ulong) -> c_int {
-    unsafe {
-        if !flags.is_null() {
-            *flags = 0;
+pub extern "system" fn canReadStatus(hnd: c_int, flags: *mut c_ulong) -> c_int {
+    guard(|| {
+        // Report real RX state: pending frames and a sticky software-overrun bit
+        // when the ring has dropped frames (kvasilloni-tlm). Lenient on an unknown
+        // handle - report 0 rather than INVHANDLE, matching the prior behavior.
+        let mut st: c_ulong = 0;
+        let conn = CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd).cloned();
+        if let Some(c) = conn {
+            if c.rx_level() > 0 {
+                st |= CAN_STAT_RX_PENDING;
+            }
+            if c.rx_overflowed() {
+                st |= CAN_STAT_SW_OVERRUN;
+            }
         }
-    }
-    CAN_OK
+        unsafe {
+            if !flags.is_null() {
+                *flags = st;
+            }
+        }
+        CAN_OK
+    })
 }
 
 #[no_mangle]
@@ -394,7 +441,7 @@ pub extern "system" fn canClose(hnd: c_int) -> c_int {
         // thread (up to the 500ms UDP read timeout) and we must not hold the
         // global map lock - and thus stall every other channel - while it does.
         let conn = CONNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&hnd);
-        if let Some(mut c) = conn {
+        if let Some(c) = conn {
             c.close();
         }
         // Closing an unknown/already-closed handle is a benign no-op (lenient so
@@ -408,14 +455,15 @@ pub extern "system" fn canClose(hnd: c_int) -> c_int {
 // shim can stand in for other CANlib apps whose import tables resolve them (see
 // AGENTS.md coverage-check procedure). Implemented under epic kvasilloni-5yp.
 
-/// Run `f` with the connection for `hnd`, holding the `CONNS` lock for the call,
-/// or return `err` when no such channel is open. Only for non-blocking ops.
+/// Run `f` with the connection for `hnd`, or return `err` when no such channel
+/// is open. The channel's `Arc` is cloned out and the global lock released before
+/// `f` runs, so per-channel work never blocks the whole table (kvasilloni-lo7).
 fn with_conn<F: FnOnce(&Conn) -> c_int>(hnd: c_int, err: c_int, f: F) -> c_int {
-    let g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    match g.get(&hnd) {
-        Some(c) => f(c),
-        None => err,
-    }
+    let conn = match CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd) {
+        Some(c) => c.clone(),
+        None => return err,
+    };
+    f(&conn)
 }
 
 /// Write a little-endian u32 into a `bufsize`-bounded C buffer.
@@ -634,7 +682,12 @@ pub extern "system" fn canGetChannelData(
             13 => out_cstr(buffer, bufsize, &format!("kvasilloni vcan{channel}")), // CHANNEL_NAME
             26 => out_cstr(buffer, bufsize, "kvasilloni virtual CAN"), // DEVDESCR_ASCII
             24 => out_cstr(buffer, bufsize, "kvasilloni"),             // MFGNAME_ASCII
-            1 => out_u32(buffer, bufsize, 0),                          // CHANNEL_CAP
+            // CHANNEL_CAP: advertise classic+FD, extended IDs, virtual (kvasilloni-vsd)
+            1 => out_u32(
+                buffer,
+                bufsize,
+                CAN_CHANNEL_CAP_EXTENDED_CAN | CAN_CHANNEL_CAP_VIRTUAL | CAN_CHANNEL_CAP_CAN_FD,
+            ),
             3 => out_u32(buffer, bufsize, 0),                          // CHANNEL_FLAGS
             4 => out_u32(buffer, bufsize, 0),                          // CARD_TYPE
             5 => out_u32(buffer, bufsize, 0),                          // CARD_NUMBER

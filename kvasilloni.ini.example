@@ -8,7 +8,7 @@
 
 [cannelloni]
 
-; IP address of the Linux host running cannelloni.
+; IP address of the Linux host running cannelloni. IPv4 or IPv6 (e.g. ::1).
 host = 192.168.1.50
 
 ; Remote port the shim sends to (cannelloni's listen port, its -l).
@@ -26,6 +26,17 @@ proto = udp
 ; TCP only: client (shim dials cannelloni -C s) or server (shim accepts
 ; cannelloni -C c). Ignored for udp.
 tcprole = client
+
+; Peer restriction (like cannelloni's -R / -p). With peercheck on (default) the
+; shim accepts inbound traffic only from `host`. Set off to accept any source.
+; In TCP-server mode, set `host` to the IP cannelloni connects FROM.
+; peercheck = on
+; allow = 192.168.1.50, 192.168.1.51   ; extra peer IPs (replaces the host default)
+
+; UDP only: if localport is busy, bind an ephemeral port instead of failing the
+; open. CAUTION: a stock cannelloni replies only to its fixed -r port, so an
+; ephemeral bind is TX-only (no RX). Leave off unless you accept that.
+; udpportfallback = off
 
 ; Optional debug log. Leave empty/omit to disable.
 ; log = C:\temp\kvasilloni.log

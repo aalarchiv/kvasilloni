@@ -157,20 +157,31 @@ precedence over the INI (handy for scripting/CI). Precedence is
 
 | Variable            | INI key     | Default     | Meaning                              |
 |---------------------|-------------|-------------|--------------------------------------|
-| `KVASILLONI_HOST`      | `host`      | `127.0.0.1` | Linux host running cannelloni        |
+| `KVASILLONI_HOST`      | `host`      | `127.0.0.1` | Linux host running cannelloni (IPv4 **or** IPv6 literal) |
 | `KVASILLONI_PORT`      | `port`      | `20000`     | Remote port the shim sends to        |
-| `KVASILLONI_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port; in UDP mode each app wants a unique value, but if the chosen port is busy the shim now auto-falls back to an ephemeral port (logged) so a second instance still opens. TCP client picks an ephemeral port and ignores this |
+| `KVASILLONI_LOCALPORT` | `localport` | `20000`     | Local UDP bind / TCP server port. In UDP mode give each instance a **unique** value (and a matching cannelloni `-r`). If it is busy the open **fails** unless `udpportfallback` is set. TCP client picks an ephemeral port and ignores this |
 | `KVASILLONI_PROTO`     | `proto`     | `udp`       | `udp` or `tcp`                       |
 | `KVASILLONI_TCPROLE`   | `tcprole`   | `client`    | `client` or `server` (TCP only)      |
+| `KVASILLONI_PEER_CHECK`| `peercheck` | `on`        | Restrict inbound to `host` (cannelloni's `-R` default). Set `off` to accept any source (= cannelloni `-p`). UDP + TCP-server only |
+| `KVASILLONI_ALLOW`     | `allow`     | (host)      | Comma/space-separated extra peer IPs allowed in (replaces the default of just `host`). Only used when `peercheck` is on |
+| `KVASILLONI_UDP_PORT_FALLBACK` | `udpportfallback` | `off` | UDP: if `localport` is busy, bind an OS-assigned ephemeral port instead of failing. **Caveat:** a stock cannelloni only sends to its fixed `-r` port, so an ephemeral bind is **TX-only** (no RX). Opt in only if that is acceptable |
 | `KVASILLONI_LOG`       | `log`       | (unset)     | If set, append a debug log here. **Use an absolute path** - a relative one resolves against the host process's working directory (often `C:\Windows\System32`), not the folder you dropped the DLL in |
 | `KVASILLONI_INI`       | -           | (auto)      | Explicit path to the INI file (**absolute**). The auto-discovery (next to the DLL, then the EXE) is CWD-independent; this override is not |
-| `KVASILLONI_CONNECT_TIMEOUT` | `connecttimeout` | `5000` | TCP client connect timeout in ms (also bounds the handshake read) |
+| `KVASILLONI_CONNECT_TIMEOUT` | `connecttimeout` | `5000` | TCP client connect timeout in ms (also bounds the handshake read **and** per-write blocking) |
 | `KVASILLONI_ACCEPT_TIMEOUT`  | `accepttimeout`  | `30000`| TCP server: how long to wait for a client, in ms |
 
 > Note: in TCP mode `canOpenChannel` **blocks the calling thread** during setup -
 > up to `connecttimeout` (client) or `accepttimeout` (server). Open the channel
 > off any UI/watchdog thread, or lower the timeout, if a fast non-blocking open
 > matters. UDP opens are non-blocking.
+
+> **Peer restriction.** Like cannelloni's `-R`, the shim accepts inbound UDP
+> datagrams and TCP-server connections **only from the configured `host`** by
+> default. Add more sources with `allow = ip1, ip2`, or disable the check with
+> `peercheck = off` (the equivalent of cannelloni's `-p`). In **TCP-server**
+> mode set `host` to the IP cannelloni will dial in *from* (or the open's accept
+> will reject it). If RX goes silent behind NAT or on a multi-homed box, the
+> source IP probably differs from `host` - widen `allow` or turn the check off.
 
 ## Linux side (cannelloni)
 
@@ -207,6 +218,11 @@ UDP is cannelloni's native/default mode and is simplest. TCP gives reliable,
 ordered delivery (better when packet loss would corrupt multi-frame NMEA 2000
 transport-protocol messages).
 
+> Need to forward the `vcan` to another SocketCAN interface but `cangw` is
+> unavailable (e.g. an unprivileged LXC/Proxmox container)? `tools/canbridge.py`
+> is a small userspace bidirectional bridge (CAN FD aware) for exactly that case.
+> Run `python3 tools/canbridge.py --help`.
+
 ## Verify end-to-end
 
 `make selftest` runs a full loopback on this Linux host using an **isolated
@@ -222,6 +238,7 @@ make selftest
 # CASE: UDP (INI config, no env)  PASS (TX + RX)
 # CASE: channel enumeration / acceptance filter / notify callback  PASS
 # CASE: close from notify callback / RX survives malformed UDP     PASS
+# CASE: peer-IP check drops non-allowed source (on=drop, off=pass) PASS
 # CASE: TCP connect/handshake timeout fast-fail                    PASS
 # CASE: TCP server role (shim listens, cannelloni client)          PASS (TX + RX)
 # CASE: TCP server accept timeout (no client)                      PASS

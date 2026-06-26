@@ -8,13 +8,13 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::raw::{c_int, c_long, c_ulong};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::wire::{self, DecodeState, Decoded, Frame};
@@ -25,6 +25,16 @@ const RING_CAP: usize = 8192;
 pub const NOTIFY_RX: u32 = 0x0001;
 /// Event code passed to the notify callback for a received frame (canstat.h).
 const EVENT_RX: c_int = 32000; // canEVENT_RX
+
+/// Milliseconds since the first call (a process-wide monotonic epoch). Used to
+/// stamp RX frames so `canRead`/`canReadWait`/notify can report a receive time
+/// instead of a constant 0. ms matches the timer scale the shim reports from
+/// canIOCTL_GET_TIMER_SCALE (1000 us/tick). Wraps after ~49 days on the 32-bit
+/// `c_ulong` the app sees, exactly as Kvaser's own timer does. See kvasilloni-kha.
+fn now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 /// Mirrors Kvaser's `canNotifyData` (canlib.h) for a receive event. Verified
 /// against the real header (Windows + Linux): the struct is
@@ -97,6 +107,10 @@ pub struct Shared {
     /// Set by `close()` so blocked readers (`canReadWait`/`canReadSync`) wake and
     /// return instead of parking until their timeout (kvasilloni-hc9).
     closed: AtomicBool,
+    /// Latched when a frame is dropped because the ring was full, so the app can
+    /// learn it fell behind via `canReadStatus` (canSTAT_SW_OVERRUN). Cleared on
+    /// `clear()` (canFlushReceiveQueue). See kvasilloni-tlm.
+    overflow: AtomicBool,
     filters: Mutex<Accept>,
     notify: Mutex<Notify>,
 }
@@ -107,6 +121,7 @@ impl Shared {
             q: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
             closed: AtomicBool::new(false),
+            overflow: AtomicBool::new(false),
             filters: Mutex::new(Accept::default()),
             notify: Mutex::new(Notify::default()),
         })
@@ -114,14 +129,17 @@ impl Shared {
 
     /// Producer side: apply acceptance filtering, enqueue (dropping when full),
     /// wake any blocked reader, then fire the notify callback if armed for RX.
-    fn push(&self, f: Frame) {
+    fn push(&self, mut f: Frame) {
         if !self.filters.lock().unwrap_or_else(|e| e.into_inner()).accepts(&f) {
             return;
         }
+        f.rx_time_ms = now_ms(); // receive timestamp (kvasilloni-kha)
         let notify_id = wire::canid_to_kvaser(f.can_id, f.fd).0;
+        let notify_time = f.rx_time_ms;
         {
             let mut q = self.q.lock().unwrap_or_else(|e| e.into_inner());
             if q.len() >= RING_CAP {
+                self.overflow.store(true, Ordering::SeqCst); // dropped: latch overrun
                 return; // ring full -> drop, no wakeup
             }
             q.push_back(f);
@@ -137,7 +155,7 @@ impl Shared {
                     tag: n.tag as *mut c_void,
                     event_type: EVENT_RX,
                     id: notify_id as c_long,
-                    time: 0,
+                    time: notify_time as c_ulong,
                 };
                 cb(&mut d);
             }
@@ -188,14 +206,22 @@ impl Shared {
         self.cv.notify_all();
     }
 
-    /// Drop all queued frames (backs `canFlushReceiveQueue`).
+    /// Drop all queued frames (backs `canFlushReceiveQueue`). Also clears the
+    /// overrun latch: flushing means the app is resyncing. (kvasilloni-tlm)
     pub fn clear(&self) {
         self.q.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.overflow.store(false, Ordering::SeqCst);
     }
 
     /// Current number of queued frames (backs canIOCTL_GET_RX_BUFFER_LEVEL).
     pub fn level(&self) -> usize {
         self.q.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Whether at least one frame has been dropped due to a full ring since the
+    /// last `clear()` (backs canReadStatus canSTAT_SW_OVERRUN). See kvasilloni-tlm.
+    pub fn overflowed(&self) -> bool {
+        self.overflow.load(Ordering::SeqCst)
     }
 
     /// Apply one `canAccept` directive (canFILTER_SET_{CODE,MASK}_{STD,EXT}).
@@ -227,24 +253,59 @@ pub struct Conn {
     running: Arc<AtomicBool>,
     negotiated: Arc<AtomicBool>,
     rx_sock: RxStop,
-    handle: Option<JoinHandle<()>>,
+    /// RX-thread join handle behind a `Mutex<Option>` so `close()` takes `&self`:
+    /// the `Conn` lives behind an `Arc` in the handle table, and `canWrite` clones
+    /// that `Arc` to send *without* holding the global map lock (kvasilloni-lo7).
+    /// A `&mut self` close would make that sharing impossible.
+    handle: Mutex<Option<JoinHandle<()>>>,
     /// Actual bound local port. For UDP this may differ from the configured
     /// `local_port` if that was busy and we fell back to ephemeral (kvasilloni-iai).
     local_port: u16,
 }
 
-/// Bind a UDP socket on `local_port`, falling back to an OS-assigned ephemeral
-/// port if the requested one is already in use (e.g. a second instance of the
-/// same app). The cannelloni peer learns our address from the datagrams we send
-/// it (or is told via `-R`/`-p`), so a different source port still works.
-fn bind_udp(local_port: u16) -> std::io::Result<UdpSocket> {
-    match UdpSocket::bind(("0.0.0.0", local_port)) {
+/// The unspecified ("any") address of the same family as `peer` - `0.0.0.0` for
+/// IPv4, `::` for IPv6 - so the shim binds the family of the configured host
+/// instead of being hard-wired to IPv4. (kvasilloni-c3x)
+fn wildcard_for(peer: IpAddr) -> IpAddr {
+    match peer {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    }
+}
+
+/// Bind a UDP socket on `bind`. If the requested port is busy and
+/// `allow_fallback` is set, bind an OS-assigned ephemeral port of the same
+/// family instead of failing.
+///
+/// The fallback is OFF by default (kvasilloni-25q): a stock cannelloni replies
+/// only to its fixed `-r` port, so an ephemeral source port receives nothing -
+/// the channel would be silently TX-only. Opt in via `udp_port_fallback` only if
+/// that is acceptable. In unit tests it is always allowed: the handle-table
+/// stress test opens many channels on the same default port with no real peer.
+fn bind_udp(bind: SocketAddr, allow_fallback: bool) -> std::io::Result<UdpSocket> {
+    let allow_fallback = allow_fallback || cfg!(test);
+    match UdpSocket::bind(bind) {
         Ok(s) => Ok(s),
-        Err(ref e) if local_port != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
-            UdpSocket::bind(("0.0.0.0", 0))
+        Err(ref e) if allow_fallback && bind.port() != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+            UdpSocket::bind(SocketAddr::new(bind.ip(), 0))
         }
         Err(e) => Err(e),
     }
+}
+
+/// The set of peer IPs allowed to send to us: an explicit `allow` list if given,
+/// otherwise just the configured peer. Only consulted when `peer_check` is on.
+fn effective_allow(cfg: &Config, peer: IpAddr) -> Vec<IpAddr> {
+    if cfg.allow.is_empty() {
+        vec![peer]
+    } else {
+        cfg.allow.clone()
+    }
+}
+
+/// Whether a datagram/connection from `from` is allowed in. `check` off => all.
+fn peer_allowed(from: IpAddr, allow: &[IpAddr], check: bool) -> bool {
+    !check || allow.iter().any(|a| *a == from)
 }
 
 /// Handle used by `close` to unblock the RX thread. The UDP variant is never
@@ -257,9 +318,17 @@ enum RxStop {
 
 impl Conn {
     pub fn connect(cfg: &Config) -> std::io::Result<Conn> {
-        let remote: SocketAddr = format!("{}:{}", cfg.host, cfg.remote_port)
+        // Parse the host as a bare IP (v4 or v6) so an IPv6 literal works without
+        // the bracket dance a SocketAddr string parse would need. (kvasilloni-c3x)
+        let peer_ip: IpAddr = cfg
+            .host
+            .trim()
             .parse()
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad host"))?;
+        let remote = SocketAddr::new(peer_ip, cfg.remote_port);
+        let wildcard = wildcard_for(peer_ip);
+        let allow = effective_allow(cfg, peer_ip);
+        let peer_check = cfg.peer_check;
 
         let shared = Shared::new();
         let running = Arc::new(AtomicBool::new(true));
@@ -267,7 +336,7 @@ impl Conn {
 
         if !cfg.tcp {
             // -------------------------------- UDP --------------------------------
-            let sock = bind_udp(cfg.local_port)?;
+            let sock = bind_udp(SocketAddr::new(wildcard, cfg.local_port), cfg.udp_port_fallback)?;
             let local_port = sock.local_addr().map(|a| a.port()).unwrap_or(cfg.local_port);
             let tx_sock = sock.try_clone()?;
             let rx_sock = sock.try_clone()?;
@@ -275,14 +344,14 @@ impl Conn {
             negotiated.store(true, Ordering::SeqCst);
 
             let (rxq, run) = (shared.clone(), running.clone());
-            let handle = std::thread::spawn(move || udp_rx_loop(rx_sock, rxq, run));
+            let handle = std::thread::spawn(move || udp_rx_loop(rx_sock, rxq, run, allow, peer_check));
             return Ok(Conn {
                 tx: Mutex::new(Tx::Udp { sock: tx_sock, remote, seq: 0 }),
                 shared,
                 running,
                 negotiated,
                 rx_sock: RxStop::Udp(sock), // original handle, used to stop the loop
-                handle: Some(handle),
+                handle: Mutex::new(Some(handle)),
                 local_port,
             });
         }
@@ -290,16 +359,23 @@ impl Conn {
         // ---------------------------------- TCP ----------------------------------
         let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms as u64);
         let stream = if cfg.tcp_server {
-            let listener = TcpListener::bind(("0.0.0.0", cfg.local_port))?;
+            let listener = TcpListener::bind(SocketAddr::new(wildcard, cfg.local_port))?;
             listener.set_nonblocking(false)?;
-            // Block for a client, but not forever.
-            let (s, _peer) =
-                accept_with_timeout(&listener, Duration::from_millis(cfg.accept_timeout_ms as u64))?;
+            // Block for an allowed client, but not forever.
+            let (s, _peer) = accept_with_timeout(
+                &listener,
+                Duration::from_millis(cfg.accept_timeout_ms as u64),
+                &allow,
+                peer_check,
+            )?;
             s
         } else {
             TcpStream::connect_timeout(&remote, connect_timeout)?
         };
         stream.set_nodelay(true).ok();
+        // Bound blocking writes so a stalled peer makes canWrite fail instead of
+        // parking forever (kvasilloni-lo7). Reuses the connect timeout budget.
+        stream.set_write_timeout(Some(connect_timeout)).ok();
 
         // Symmetric handshake: send + expect "CANNELLONIv1", bounded by the
         // connect timeout so a peer that connects but never sends the banner
@@ -321,7 +397,7 @@ impl Conn {
             running,
             negotiated,
             rx_sock: RxStop::Tcp(stop_stream),
-            handle: Some(handle),
+            handle: Mutex::new(Some(handle)),
             local_port,
         })
     }
@@ -355,7 +431,17 @@ impl Conn {
             Tx::Tcp { stream } => {
                 let mut buf = Vec::with_capacity(16);
                 wire::encode_frame(&mut buf, f);
-                stream.write_all(&buf)?;
+                if let Err(e) = stream.write_all(&buf) {
+                    // A timed-out or partial write leaves the headerless stream
+                    // mid-frame; never stream more bytes into a desynced socket.
+                    // Tear the connection down so this and future writes fail
+                    // fast and the app can reopen, and the RX loop exits too.
+                    // (kvasilloni-lo7)
+                    self.negotiated.store(false, Ordering::SeqCst);
+                    self.running.store(false, Ordering::SeqCst);
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Err(e);
+                }
             }
         }
         Ok(())
@@ -363,6 +449,11 @@ impl Conn {
 
     pub fn read(&self) -> Option<Frame> {
         self.shared.pop()
+    }
+
+    /// Whether RX frames have been dropped due to a full ring (canSTAT_SW_OVERRUN).
+    pub fn rx_overflowed(&self) -> bool {
+        self.shared.overflowed()
     }
 
     /// Clone of the shared RX state, so a blocking read (`canReadWait` /
@@ -392,7 +483,7 @@ impl Conn {
         self.shared.set_notify(cb, flags, tag);
     }
 
-    pub fn close(&mut self) {
+    pub fn close(&self) {
         self.running.store(false, Ordering::SeqCst);
         self.negotiated.store(false, Ordering::SeqCst);
         self.shared.mark_closed(); // wake blocked canReadWait/canReadSync (kvasilloni-hc9)
@@ -402,7 +493,10 @@ impl Conn {
             }
             RxStop::Udp(_) => { /* the 500ms read timeout lets the loop exit */ }
         }
-        if let Some(h) = self.handle.take() {
+        // Take the join handle under its lock; only the first close() joins (a
+        // later Drop sees None). idempotent across canClose + Drop.
+        let h = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = h {
             // If close() runs ON the RX thread itself - e.g. an app's
             // canSetNotify callback (which fires on the RX thread) calls
             // canClose - then joining would deadlock the thread on itself.
@@ -436,12 +530,26 @@ fn handshake(stream: &TcpStream, timeout: Duration) -> std::io::Result<()> {
     Ok(())
 }
 
-fn accept_with_timeout(l: &TcpListener, total: Duration) -> std::io::Result<(TcpStream, SocketAddr)> {
+fn accept_with_timeout(
+    l: &TcpListener,
+    total: Duration,
+    allow: &[IpAddr],
+    peer_check: bool,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
     l.set_nonblocking(true)?;
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     loop {
         match l.accept() {
             Ok((s, a)) => {
+                // Reject connections from a non-allowed source (cannelloni's -R
+                // default; kvasilloni-872) and keep waiting for an allowed one.
+                if !peer_allowed(a.ip(), allow, peer_check) {
+                    let _ = s.shutdown(Shutdown::Both);
+                    if start.elapsed() > total {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no allowed client"));
+                    }
+                    continue;
+                }
                 s.set_nonblocking(false)?;
                 return Ok((s, a));
             }
@@ -503,11 +611,23 @@ fn guarded_udp_ingest(buf: &[u8], rx: &Arc<Shared>) {
     }));
 }
 
-fn udp_rx_loop(sock: UdpSocket, rx: Arc<Shared>, running: Arc<AtomicBool>) {
+fn udp_rx_loop(
+    sock: UdpSocket,
+    rx: Arc<Shared>,
+    running: Arc<AtomicBool>,
+    allow: Vec<IpAddr>,
+    peer_check: bool,
+) {
     let mut buf = [0u8; 2048];
     while running.load(Ordering::SeqCst) {
         match sock.recv_from(&mut buf) {
-            Ok((n, _from)) => guarded_udp_ingest(&buf[..n], &rx),
+            Ok((n, from)) => {
+                // Drop datagrams from a non-allowed source (cannelloni's -R
+                // default; kvasilloni-872) before they reach the parser.
+                if peer_allowed(from.ip(), &allow, peer_check) {
+                    guarded_udp_ingest(&buf[..n], &rx);
+                }
+            }
             Err(ref e)
                 if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
             {
@@ -571,7 +691,7 @@ mod tests {
     use super::*;
 
     fn frame(can_id: u32) -> Frame {
-        Frame { can_id, len: 1, fd: false, fd_flags: 0, data: [0u8; 64] }
+        Frame { can_id, len: 1, fd: false, fd_flags: 0, data: [0u8; 64], rx_time_ms: 0 }
     }
 
     #[test]
@@ -584,6 +704,52 @@ mod tests {
         s.clear();
         assert_eq!(s.level(), 0);
         assert!(s.pop().is_none());
+    }
+
+    #[test]
+    fn overflow_latches_on_full_ring_and_clears_on_flush() {
+        // kvasilloni-tlm: dropping a frame because the ring is full must latch an
+        // overrun the app can see via canReadStatus, and a flush must clear it.
+        let s = Shared::new();
+        assert!(!s.overflowed());
+        for i in 0..(RING_CAP + 10) {
+            s.push(frame(0x100 + i as u32));
+        }
+        assert!(s.overflowed(), "full ring did not latch overrun");
+        assert_eq!(s.level(), RING_CAP, "ring grew past its cap");
+        s.clear();
+        assert!(!s.overflowed(), "flush did not clear the overrun latch");
+    }
+
+    #[test]
+    fn push_stamps_receive_timestamp() {
+        // kvasilloni-kha: an enqueued frame carries a non-default RX timestamp so
+        // canRead/canReadWait can report it. (now_ms is monotonic from first use.)
+        let s = Shared::new();
+        let _ = now_ms(); // ensure the epoch is initialized before we sleep
+        std::thread::sleep(Duration::from_millis(2));
+        s.push(frame(0x7FF));
+        let f = s.pop().expect("frame");
+        assert!(f.rx_time_ms > 0, "receive timestamp was not stamped");
+    }
+
+    #[test]
+    fn peer_allowed_matches_only_listed_ips_unless_disabled() {
+        // kvasilloni-872: with the check on, only allow-listed sources pass; with
+        // it off, anyone does.
+        let a: IpAddr = "127.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.9".parse().unwrap();
+        let allow = [a];
+        assert!(peer_allowed(a, &allow, true));
+        assert!(!peer_allowed(b, &allow, true));
+        assert!(peer_allowed(b, &allow, false)); // check disabled => all pass
+    }
+
+    #[test]
+    fn wildcard_matches_peer_family() {
+        // kvasilloni-c3x: we bind the unspecified address of the peer's family.
+        assert_eq!(wildcard_for("127.0.0.1".parse().unwrap()), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(wildcard_for("::1".parse().unwrap()), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
     }
 
     #[test]

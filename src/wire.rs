@@ -86,11 +86,16 @@ pub struct Frame {
     pub fd: bool,
     pub fd_flags: u8,
     pub data: [u8; 64],
+    /// Monotonic receive timestamp in milliseconds, stamped when the RX thread
+    /// enqueues the frame (0 on TX / before stamping). NOT part of the wire
+    /// format - the codec neither writes nor reads it. Reported to the app by
+    /// `canRead`/`canReadWait`/notify in Kvaser timer units. See kvasilloni-kha.
+    pub rx_time_ms: u64,
 }
 
 impl Default for Frame {
     fn default() -> Self {
-        Frame { can_id: 0, len: 0, fd: false, fd_flags: 0, data: [0; 64] }
+        Frame { can_id: 0, len: 0, fd: false, fd_flags: 0, data: [0; 64], rx_time_ms: 0 }
     }
 }
 
@@ -268,7 +273,12 @@ pub fn parse_udp(buf: &[u8]) -> Option<Vec<Frame>> {
         return None;
     }
     let count = u16::from_be_bytes([buf[3], buf[4]]);
-    let mut frames = Vec::with_capacity(count as usize);
+    // Cap the pre-allocation to what this datagram could physically hold (each
+    // frame is >= FRAME_BASE_SIZE on the wire). `count` is attacker-controlled,
+    // so trusting it would let a 7-byte spoofed packet force a ~5MB allocation.
+    // The per-frame bounds below still validate the real content. (kvasilloni-56p)
+    let cap = (count as usize).min(buf.len() / FRAME_BASE_SIZE + 1);
+    let mut frames = Vec::with_capacity(cap);
     let mut p = DATA_PACKET_BASE_SIZE;
     for _ in 0..count {
         if p + FRAME_BASE_SIZE > buf.len() {
@@ -493,6 +503,18 @@ mod tests {
         let _ = decode_stream(&[], &mut f2, &mut st2);
         let _ = decode_stream(&[0, 0, 1, 0x23], &mut f2, &mut st2);
         assert!(matches!(decode_stream(&[CANFD_FRAME | 70], &mut f2, &mut st2), Decoded::Error));
+    }
+
+    #[test]
+    fn parse_udp_huge_count_does_not_over_allocate() {
+        // A 7-byte datagram claiming count=65535 must not pre-allocate for 65535
+        // frames; it has no frame bodies, so parsing returns None gracefully.
+        // (kvasilloni-56p: capacity is bounded by the datagram length.)
+        let pkt = vec![0x02, 0x00, 0x00, 0xFF, 0xFF]; // ver, DATA, seq, count=65535
+        assert!(parse_udp(&pkt).is_none());
+        // A well-formed single-frame packet with the same shape still parses.
+        let ok = build_udp(&mk(0x123, &[1, 2, 3]), 0);
+        assert_eq!(parse_udp(&ok).unwrap().len(), 1);
     }
 
     #[test]

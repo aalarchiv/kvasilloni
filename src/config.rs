@@ -15,14 +15,17 @@
 //! `kvasilloni.ini` (a `[cannelloni]` section header is optional):
 //! ```ini
 //! [cannelloni]
-//! host      = 192.168.1.50
+//! host      = 192.168.1.50   ; IPv4 or IPv6 literal
 //! port      = 20000
 //! localport = 20000        ; UDP only: must be unique per app running simultaneously
 //! proto     = udp        ; udp | tcp
 //! tcprole   = client     ; client | server  (tcp only)
+//! peercheck = on         ; restrict inbound to host (cannelloni -R); off = accept all (-p)
+//! allow     =            ; extra peer IPs, comma/space separated (replaces host default)
+//! udpportfallback = off  ; UDP: bind ephemeral if localport busy (TX-only; see below)
 //! log       = C:\temp\kvasilloni.log
 //! channels  = 1          ; advertised by canGetNumberOfChannels (retargeting)
-//! connecttimeout = 5000  ; tcp client connect timeout, ms (also bounds handshake)
+//! connecttimeout = 5000  ; tcp client connect timeout, ms (also bounds handshake + writes)
 //! accepttimeout  = 30000 ; tcp server: how long to wait for a client, ms
 //! ```
 //!
@@ -31,6 +34,7 @@
 //! watchdog thread, or lower the timeout, if a fast non-blocking open matters.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -47,6 +51,19 @@ pub struct Config {
     pub connect_timeout_ms: u32,
     /// TCP server accept timeout, milliseconds (how long to wait for a client).
     pub accept_timeout_ms: u32,
+    /// UDP only: if the configured `local_port` is busy, bind an OS-assigned
+    /// ephemeral port instead of failing the open. OFF by default: a stock
+    /// cannelloni replies only to its fixed `-r` port, so an ephemeral bind
+    /// receives nothing (TX-only). Opt in only if you knowingly want that.
+    /// See kvasilloni-25q / kvasilloni-iai.
+    pub udp_port_fallback: bool,
+    /// Restrict inbound traffic to the configured peer (cannelloni's `-R`/`-p`).
+    /// ON by default: UDP datagrams and TCP-server connections from any source
+    /// other than `host` (or an `allow` entry) are dropped. See kvasilloni-872.
+    pub peer_check: bool,
+    /// Explicit allow-list of peer IPs. Empty => just the configured `host`.
+    /// Only consulted when `peer_check` is on.
+    pub allow: Vec<IpAddr>,
 }
 
 impl Default for Config {
@@ -61,6 +78,9 @@ impl Default for Config {
             channels: 1,
             connect_timeout_ms: 5000,
             accept_timeout_ms: 30000,
+            udp_port_fallback: false,
+            peer_check: true,
+            allow: Vec::new(),
         }
     }
 }
@@ -106,6 +126,15 @@ impl Config {
         if let Some(v) = m.get("accepttimeout").and_then(|v| v.parse().ok()) {
             self.accept_timeout_ms = v;
         }
+        if let Some(v) = m.get("udpportfallback") {
+            self.udp_port_fallback = parse_bool(v);
+        }
+        if let Some(v) = m.get("peercheck") {
+            self.peer_check = parse_bool(v);
+        }
+        if let Some(v) = m.get("allow") {
+            self.allow = parse_ip_list(v);
+        }
     }
 
     fn apply_env(&mut self) {
@@ -139,11 +168,38 @@ impl Config {
         if let Some(v) = e("KVASILLONI_ACCEPT_TIMEOUT").and_then(|v| v.parse().ok()) {
             self.accept_timeout_ms = v;
         }
+        if let Some(v) = e("KVASILLONI_UDP_PORT_FALLBACK") {
+            self.udp_port_fallback = parse_bool(&v);
+        }
+        if let Some(v) = e("KVASILLONI_PEER_CHECK") {
+            self.peer_check = parse_bool(&v);
+        }
+        if let Some(v) = e("KVASILLONI_ALLOW") {
+            self.allow = parse_ip_list(&v);
+        }
     }
 }
 
 fn starts_with_ci(s: &str, c: u8) -> bool {
     matches!(s.as_bytes().first(), Some(&b) if b.to_ascii_lowercase() == c)
+}
+
+/// Parse a boolean-ish config value. `1/true/yes/on/enable[d]` (any case) =>
+/// true; everything else (including empty) => false.
+fn parse_bool(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "enable" | "enabled"
+    )
+}
+
+/// Parse a comma/whitespace-separated list of IP literals (v4 or v6), skipping
+/// anything that does not parse. Used for the peer allow-list.
+fn parse_ip_list(s: &str) -> Vec<IpAddr> {
+    s.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| t.parse::<IpAddr>().ok())
+        .collect()
 }
 
 /// Minimal INI parser: `key = value`, `;`/`#` comments, optional `[section]`
@@ -307,5 +363,38 @@ mod tests {
         cfg.apply_map(&m);
         assert_eq!(cfg.connect_timeout_ms, 1500);
         assert_eq!(cfg.accept_timeout_ms, 8000);
+    }
+
+    #[test]
+    fn peer_and_fallback_defaults_and_parse() {
+        // Secure-by-default: peer check on, fallback off, no explicit allow-list.
+        let cfg = Config::default();
+        assert!(cfg.peer_check);
+        assert!(!cfg.udp_port_fallback);
+        assert!(cfg.allow.is_empty());
+
+        let mut cfg = Config::default();
+        let mut m = HashMap::new();
+        m.insert("peercheck".into(), "off".into());
+        m.insert("udpportfallback".into(), "1".into());
+        m.insert("allow".into(), "127.0.0.1, ::1 10.0.0.5".into());
+        cfg.apply_map(&m);
+        assert!(!cfg.peer_check);
+        assert!(cfg.udp_port_fallback);
+        let want: Vec<IpAddr> = ["127.0.0.1", "::1", "10.0.0.5"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(cfg.allow, want);
+    }
+
+    #[test]
+    fn parse_bool_and_ip_list_are_lenient() {
+        assert!(parse_bool("YES") && parse_bool("On") && parse_bool("1"));
+        assert!(!parse_bool("0") && !parse_bool("") && !parse_bool("nope"));
+        // Invalid entries are skipped, not fatal.
+        let ips = parse_ip_list("not-an-ip, 192.168.0.1,,fe80::1");
+        let want: Vec<IpAddr> = ["192.168.0.1", "fe80::1"].iter().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(ips, want);
     }
 }

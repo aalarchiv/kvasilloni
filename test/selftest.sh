@@ -239,7 +239,10 @@ multi_cap="$(mktemp)"; multi_out="$(mktemp)"
 candump -L "$VCAN" > "$multi_cap" 2>/dev/null & MCDPID=$!; PIDS+=("$MCDPID")
 "$CANNBIN" -I "$VCAN" -R 127.0.0.1 -r 20113 -l 20112 >/dev/null 2>&1 & MCNPID=$!; PIDS+=("$MCNPID")
 sleep 1.0
+# The two channels share one localport, so the 2nd open needs the ephemeral
+# fallback, which is now opt-in (KVASILLONI_UDP_PORT_FALLBACK=1; kvasilloni-25q).
 ( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20112 KVASILLONI_LOCALPORT=20113 \
+    KVASILLONI_UDP_PORT_FALLBACK=1 \
     wine ./canshim_probe.exe --multi 0x18EEFF10 0x18EEFF11 ) > "$multi_out" 2>/dev/null & MPBPID=$!; PIDS+=("$MPBPID")
 sleep 2.0
 cansend "$VCAN" "18FF0113#CD" 2>/dev/null
@@ -319,6 +322,40 @@ if command -v python3 >/dev/null 2>&1; then
 else
   echo "  SKIP: python3 not available for raw UDP injection"
 fi
+
+# --- peer-IP check (kvasilloni-872): with the allow-list set to a bogus, non-
+# loopback IP, cannelloni's 127.0.0.1 datagrams must be DROPPED before canRead;
+# disabling the check (KVASILLONI_PEER_CHECK=off) must let the same frame through.
+# This isolates the filter as the cause: on => no RX, off => RX.
+echo; echo "===== CASE: peer-IP check drops non-allowed source (UDP) ====="
+pc_out1="$(mktemp)"; pc_out2="$(mktemp)"
+"$CANNBIN" -I "$VCAN" -R 127.0.0.1 -r 20119 -l 20118 >/dev/null 2>&1 & PCNPID=$!; PIDS+=("$PCNPID")
+sleep 1.0
+( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20118 KVASILLONI_LOCALPORT=20119 \
+    KVASILLONI_ALLOW=10.255.255.254 \
+    wine ./canshim_probe.exe 0x18EEFF50 ext DE AD ) > "$pc_out1" 2>/dev/null & PCPB1=$!; PIDS+=("$PCPB1")
+sleep 2.0
+cansend "$VCAN" "18FF0150#11" 2>/dev/null
+echo "  injected 18FF0150 with allow=10.255.255.254, peer check ON (should drop)"
+wait "$PCPB1" 2>/dev/null
+sleep 0.5
+( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20118 KVASILLONI_LOCALPORT=20119 \
+    KVASILLONI_ALLOW=10.255.255.254 KVASILLONI_PEER_CHECK=off \
+    wine ./canshim_probe.exe 0x18EEFF50 ext DE AD ) > "$pc_out2" 2>/dev/null & PCPB2=$!; PIDS+=("$PCPB2")
+sleep 2.0
+cansend "$VCAN" "18FF0150#11" 2>/dev/null
+echo "  injected 18FF0150 with peer check OFF (should deliver)"
+wait "$PCPB2" 2>/dev/null
+kill "$PCNPID" 2>/dev/null
+sleep 0.8
+if ! grep -qE "RX id=0x18FF0150" "$pc_out1" && grep -qE "RX id=0x18FF0150" "$pc_out2"; then
+  echo "  PASS: non-allowed source dropped with peer check on, delivered with it off"
+else
+  echo "  FAIL: peer check wrong (on must drop, off must deliver)"
+  echo "  --- check on ---"; sed 's/^/    /' "$pc_out1"
+  echo "  --- check off ---"; sed 's/^/    /' "$pc_out2"; FAIL=1
+fi
+rm -f "$pc_out1" "$pc_out2"
 
 # ===================== timeout + role coverage (epic kvasilloni-nzp) =====================
 # Helpers to pull the two fields out of the probe's "TIMEDOPEN ms=.. h=.." line.
@@ -463,10 +500,12 @@ fi
 # Hammer the shim from several wine threads at once (rapid open/close + write/read)
 # over UDP with no cannelloni. `timeout` bounds a hang so a deadlock fails the test
 # rather than stalling the suite. The host-side `cargo test` proves no handle leak;
-# this proves the shipped DLL survives the real Windows threading model.
+# this proves the shipped DLL survives the real Windows threading model. Many
+# channels share one localport, so opt into the ephemeral fallback (kvasilloni-25q).
 echo; echo "===== CASE: concurrency stress, real DLL (--stress) ====="
 st_out="$(mktemp)"
 ( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20130 KVASILLONI_LOCALPORT=20131 \
+    KVASILLONI_UDP_PORT_FALLBACK=1 \
     timeout 40 wine ./canshim_probe.exe --stress 4 4 ) > "$st_out" 2>/dev/null
 st_rc=$?
 if [ "$st_rc" = 124 ]; then
