@@ -9,15 +9,27 @@
 #   * probe canWrite   -> appears on vcan1 (candump)
 #   * cansend on vcan1 -> delivered to probe canRead
 #
-# Needs: wine, can-utils, cmake+g++ (to build cannelloni), i686 mingw (probe),
-#        a cargo-built 32-bit DLL, and permission to create a vcan link.
+# Needs: wine, can-utils, cmake+g++ (to build cannelloni), mingw (probe),
+#        a cargo-built DLL, and permission to create a vcan link.
 # Skips gracefully (exit 0) when a prerequisite is missing.
+#
+# Env: SELFTEST_VCAN (default vcan1), SELFTEST_ARCH (32 [default] | 64 - which
+#      DLL/probe arch to build and run; wine-10 runs both via wow64).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="$ROOT/target/selftest"
 CANN="$ROOT/refs/cannelloni"
 VCAN="${SELFTEST_VCAN:-vcan1}"
-DLL="$ROOT/target/i686-pc-windows-gnu/release/canlib32.dll"
+# Architecture under test: 32 (default) or 64. wine-10 runs both (wow64), so the
+# same harness exercises either DLL. SELFTEST_ARCH=64 covers the x86_64 build's
+# runtime behaviour (notify struct, FFI, handle table) - kvasilloni-868.
+ARCH="${SELFTEST_ARCH:-32}"
+case "$ARCH" in
+  32) RUST_TARGET="i686-pc-windows-gnu";   MINGW="i686-w64-mingw32-gcc" ;;
+  64) RUST_TARGET="x86_64-pc-windows-gnu"; MINGW="x86_64-w64-mingw32-gcc" ;;
+  *)  echo "SELFTEST: bad SELFTEST_ARCH=$ARCH (use 32 or 64)"; exit 2 ;;
+esac
+DLL="$ROOT/target/$RUST_TARGET/release/canlib32.dll"
 
 skip() { echo "SELFTEST SKIP: $*"; exit 0; }
 need() { command -v "$1" >/dev/null 2>&1 || skip "missing tool: $1"; }
@@ -30,20 +42,20 @@ fi
 need wine
 need candump
 need cansend
-need i686-w64-mingw32-gcc
+need "$MINGW"
 
 # build the DLL if missing
 if [ ! -f "$DLL" ]; then
   need cargo
-  echo "== building 32-bit DLL =="
-  ( cd "$ROOT" && cargo build --release --target i686-pc-windows-gnu ) >/dev/null 2>&1 \
+  echo "== building $ARCH-bit DLL ($RUST_TARGET) =="
+  ( cd "$ROOT" && cargo build --release --target "$RUST_TARGET" ) >/dev/null 2>&1 \
     || skip "cargo build failed"
 fi
 [ -f "$DLL" ] || skip "DLL not found: $DLL"
 
 mkdir -p "$BUILD"
 # build the probe and place the shim beside it (wine LoadLibrary checks app dir)
-i686-w64-mingw32-gcc -O2 -Wall "$ROOT/test/canshim_probe.c" -o "$BUILD/canshim_probe.exe" \
+"$MINGW" -O2 -Wall "$ROOT/test/canshim_probe.c" -o "$BUILD/canshim_probe.exe" \
   || skip "probe build failed"
 cp -f "$DLL" "$BUILD/canlib32.dll"
 
@@ -73,7 +85,7 @@ fi
 # down (a freshly added vcan is down) so the FD case can inject via cansend.
 $SUDO ip link set "$VCAN" mtu 72 2>/dev/null || true
 $SUDO ip link set up "$VCAN" 2>/dev/null || skip "cannot bring up $VCAN"
-echo "using isolated bus: $VCAN"
+echo "using isolated bus: $VCAN  (DLL arch: ${ARCH}-bit)"
 
 FAIL=0
 PIDS=()
@@ -254,6 +266,59 @@ else
   echo "  FAIL: first channel did not receive injected frame"; sed 's/^/    /' "$multi_out"; FAIL=1
 fi
 rm -f "$multi_cap" "$multi_out"
+
+# --- close from inside a notify callback (cqe): the callback runs on the RX
+# thread and calls canClose; it must not self-join/deadlock, and it must observe
+# the right info.rx.id. closed=0 in the output means the close deadlocked.
+echo; echo "===== CASE: close from notify callback (--notify-close, UDP) ====="
+nc_out="$(mktemp)"
+"$CANNBIN" -I "$VCAN" -R 127.0.0.1 -r 20115 -l 20114 >/dev/null 2>&1 & NCNPID=$!; PIDS+=("$NCNPID")
+sleep 1.0
+( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20114 KVASILLONI_LOCALPORT=20115 \
+    wine ./canshim_probe.exe --notify-close ) > "$nc_out" 2>/dev/null & NCPBPID=$!; PIDS+=("$NCPBPID")
+sleep 2.0
+cansend "$VCAN" "18FF0114#7A" 2>/dev/null
+echo "  injected: 18FF0114 (callback calls canClose)"
+wait "$NCPBPID" 2>/dev/null
+kill "$NCNPID" 2>/dev/null
+sleep 0.8
+if grep -qE "NOTIFYCLOSE id=0x18FF0114 closed=1" "$nc_out"; then
+  echo "  PASS: canClose from the notify callback returned (no self-join), id matched"
+else
+  echo "  FAIL: close-from-callback deadlocked (closed=0) or wrong id"; sed 's/^/    /' "$nc_out"; FAIL=1
+fi
+rm -f "$nc_out"
+
+# --- RX thread survives malformed input (kkt): a datagram claiming len=100 (which
+# would have panicked the pre-fix decoder) must be dropped, and a following valid
+# frame must still be delivered - proving the RX thread did not die.
+echo; echo "===== CASE: RX survives malformed UDP (kkt e2e) ====="
+if command -v python3 >/dev/null 2>&1; then
+  mal_out="$(mktemp)"
+  "$CANNBIN" -I "$VCAN" -R 127.0.0.1 -r 20117 -l 20116 >/dev/null 2>&1 & MLNPID=$!; PIDS+=("$MLNPID")
+  sleep 1.0
+  ( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20116 KVASILLONI_LOCALPORT=20117 \
+      wine ./canshim_probe.exe 0x18EEFF20 ext DE AD ) > "$mal_out" 2>/dev/null & MLPBPID=$!; PIDS+=("$MLPBPID")
+  sleep 2.0
+  # malformed cannelloni UDP straight to the shim RX port: count=1, classic frame,
+  # len=100 (>64) + 100 data bytes (passes the buffer bound, hits the len guard).
+  python3 -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.sendto(bytes([2,0,0,0,1,0,0,1,0x23,100])+b'\xAB'*100,('127.0.0.1',20117))" 2>/dev/null
+  echo "  injected malformed UDP (len=100) to shim RX port 20117"
+  sleep 0.3
+  cansend "$VCAN" "18FF0117#0102" 2>/dev/null
+  echo "  injected valid 18FF0117"
+  wait "$MLPBPID" 2>/dev/null
+  kill "$MLNPID" 2>/dev/null
+  sleep 0.8
+  if grep -qE "RX id=0x18FF0117" "$mal_out"; then
+    echo "  PASS: RX thread survived the malformed datagram and delivered the valid frame"
+  else
+    echo "  FAIL: valid frame not received after malformed input (RX thread may have died)"; sed 's/^/    /' "$mal_out"; FAIL=1
+  fi
+  rm -f "$mal_out"
+else
+  echo "  SKIP: python3 not available for raw UDP injection"
+fi
 
 echo
 if [ "$FAIL" = 0 ]; then echo "SELFTEST: PASS"; else echo "SELFTEST: FAIL"; fi

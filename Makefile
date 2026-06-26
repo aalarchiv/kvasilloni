@@ -5,7 +5,8 @@
 #   make dll64      build only the 64-bit DLL
 #   make test       run host unit tests (wire codec, golden vectors)
 #   make verify     confirm the exports are present and undecorated (32-bit)
-#   make selftest   end-to-end over vcan1 + cannelloni + wine (needs root/wine)
+#   make selftest   end-to-end over vcan1 + cannelloni + wine (32-bit DLL)
+#   make selftest64 same end-to-end suite against the 64-bit DLL (wine wow64)
 #   make clean
 
 T32 := i686-pc-windows-gnu
@@ -22,7 +23,7 @@ EXPORTS := canInitializeLibrary canOpenChannel canSetBusParams canBusOn canBusOf
            canIoCtl canAccept canObjBufSetFilter \
            canGetNumberOfChannels canGetChannelData canSetNotify
 
-.PHONY: all dll32 dll64 test verify selftest clean
+.PHONY: all dll32 dll64 test verify selftest selftest64 clean
 
 all: dll32 dll64
 
@@ -47,6 +48,9 @@ verify: dll32
 
 selftest: dll32
 	bash test/selftest.sh
+
+selftest64: dll64
+	SELFTEST_ARCH=64 bash test/selftest.sh
 
 clean:
 	cargo clean

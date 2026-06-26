@@ -18,6 +18,11 @@
  *       canAccept only <accept_id>, then poll canRead and print every RX id.
  *   canshim_probe.exe --notify <hex_id> <std|ext> <hex_data...>
  *       register a canSetNotify(canNOTIFY_RX) callback, poll, print the count.
+ *   canshim_probe.exe --multi <hex_id_a> <hex_id_b>
+ *       open two channels at once; print distinct handles, TX both, RX the first.
+ *   canshim_probe.exe --notify-close
+ *       call canClose from inside the notify callback (RX thread); print the
+ *       observed info.rx.id and whether the close returned (no self-join).
  */
 #include <windows.h>
 #include <stdio.h>
@@ -63,6 +68,7 @@ static int run_enum(HMODULE dll);
 static int run_accept(HMODULE dll, int argc, char **argv);
 static int run_notify(HMODULE dll, int argc, char **argv);
 static int run_multi(HMODULE dll, int argc, char **argv);
+static int run_notify_close(HMODULE dll);
 
 int main(int argc, char **argv)
 {
@@ -95,6 +101,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--accept")) return run_accept(dll, argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--notify")) return run_notify(dll, argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--multi"))  return run_multi(dll, argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--notify-close")) return run_notify_close(dll);
 
 #define GET(v, t, n) v = (t)GetProcAddress(dll, n); \
     if (!v) { fprintf(stderr, "PROBE: missing export %s\n", n); return 2; }
@@ -274,5 +281,51 @@ static int run_multi(HMODULE dll, int argc, char **argv)
     }
     if (p_close) { p_close(ha); p_close(hb); }
     FreeLibrary(dll);
+    return 0;
+}
+
+/* --notify-close globals: the RX-thread callback closes the channel mid-event. */
+static volatile long g_nc_id = -1;
+static volatile int  g_nc_closed = 0;
+static fn_close      g_nc_pclose = NULL;
+static int           g_nc_handle = -1;
+static void __stdcall notify_close_cb(notify_data *d)
+{
+    g_nc_id = d->id;                            /* read info.rx.id at real offset */
+    if (g_nc_pclose) g_nc_pclose(g_nc_handle);  /* canClose from inside the cb    */
+    g_nc_closed = 1;                            /* reached only if canClose returned */
+}
+
+/* --notify-close : an app calling canClose from inside its canSetNotify callback
+ * (which fires on the RX thread) must NOT deadlock by joining the RX thread to
+ * itself (kvasilloni-cqe). The callback also reads info.rx.id, verifying notify
+ * value delivery through the real struct offsets. If the close self-joined,
+ * g_nc_closed never flips and the printed line reports closed=0 -> selftest FAIL. */
+static int run_notify_close(HMODULE dll)
+{
+    fn_init      p_init      = (fn_init)     GetProcAddress(dll, "canInitializeLibrary");
+    fn_open      p_open      = (fn_open)     GetProcAddress(dll, "canOpenChannel");
+    fn_setbus    p_setbus    = (fn_setbus)   GetProcAddress(dll, "canSetBusParams");
+    fn_buson     p_buson     = (fn_buson)    GetProcAddress(dll, "canBusOn");
+    fn_setnotify p_setnotify = (fn_setnotify)GetProcAddress(dll, "canSetNotify");
+    fn_close     p_close     = (fn_close)    GetProcAddress(dll, "canClose");
+    int h, loops;
+    if (!p_open || !p_setnotify || !p_close) { fprintf(stderr, "PROBE: notify-close exports missing\n"); return 2; }
+    if (p_init) p_init();
+    h = p_open(0, 0);
+    if (h < 0) { fprintf(stderr, "PROBE: canOpenChannel failed %d\n", h); return 3; }
+    if (p_setbus) p_setbus(h, 250000, 0, 0, 0, 0, 0);
+    if (p_buson) p_buson(h);
+    g_nc_pclose = p_close; g_nc_handle = h;
+    p_setnotify(h, (void*)notify_close_cb, canNOTIFY_RX, NULL);
+    printf("PROBE: NOTIFYCLOSE armed\n");
+    fflush(stdout);
+    /* up to ~6s for one frame -> callback -> canClose to complete */
+    for (loops = 0; loops < 600 && !g_nc_closed; loops++) Sleep(10);
+    printf("PROBE: NOTIFYCLOSE id=0x%lX closed=%d\n", g_nc_id, g_nc_closed);
+    fflush(stdout);
+    /* Channel was closed from the callback; let the detached RX thread exit, then
+     * let process teardown unload the DLL (no FreeLibrary on this path). */
+    Sleep(700);
     return 0;
 }
