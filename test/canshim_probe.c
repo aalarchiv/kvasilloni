@@ -23,6 +23,14 @@
  *   canshim_probe.exe --notify-close
  *       call canClose from inside the notify callback (RX thread); print the
  *       observed info.rx.id and whether the close returned (no self-join).
+ *   canshim_probe.exe --timed-open
+ *       time canOpenChannel (TCP); print elapsed ms + handle, to assert connect/
+ *       accept timeouts bound the open (kvasilloni-7yl/-6ot).
+ *   canshim_probe.exe --multi-rx <remoteA> <localA> <remoteB> <localB>
+ *       open two channels to two distinct cannelloni endpoints; print each RX
+ *       labelled by channel, proving per-channel RX isolation (kvasilloni-pwx).
+ *   canshim_probe.exe --stress <threads> <iters>
+ *       hammer open/write/read/close from N threads at once (kvasilloni-eoq).
  */
 #include <windows.h>
 #include <stdio.h>
@@ -69,6 +77,9 @@ static int run_accept(HMODULE dll, int argc, char **argv);
 static int run_notify(HMODULE dll, int argc, char **argv);
 static int run_multi(HMODULE dll, int argc, char **argv);
 static int run_notify_close(HMODULE dll);
+static int run_timed_open(HMODULE dll);
+static int run_multi_rx(HMODULE dll, int argc, char **argv);
+static int run_stress(HMODULE dll, int argc, char **argv);
 
 int main(int argc, char **argv)
 {
@@ -102,6 +113,9 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--notify")) return run_notify(dll, argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--multi"))  return run_multi(dll, argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--notify-close")) return run_notify_close(dll);
+    if (argc > 1 && !strcmp(argv[1], "--timed-open")) return run_timed_open(dll);
+    if (argc > 1 && !strcmp(argv[1], "--multi-rx")) return run_multi_rx(dll, argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--stress"))  return run_stress(dll, argc, argv);
 
 #define GET(v, t, n) v = (t)GetProcAddress(dll, n); \
     if (!v) { fprintf(stderr, "PROBE: missing export %s\n", n); return 2; }
@@ -327,5 +341,147 @@ static int run_notify_close(HMODULE dll)
     /* Channel was closed from the callback; let the detached RX thread exit, then
      * let process teardown unload the DLL (no FreeLibrary on this path). */
     Sleep(700);
+    return 0;
+}
+
+/* --timed-open : time canOpenChannel and report elapsed ms + handle. The shim's
+ * role (TCP client vs server) comes from KVASILLONI_* env set by the harness, so
+ * this one mode covers both the client connect timeout (kvasilloni-7yl) and the
+ * server accept timeout (kvasilloni-6ot): the harness asserts a no-peer open
+ * fails in ~the configured timeout instead of a long default. */
+static int run_timed_open(HMODULE dll)
+{
+    fn_init  p_init  = (fn_init) GetProcAddress(dll, "canInitializeLibrary");
+    fn_open  p_open  = (fn_open) GetProcAddress(dll, "canOpenChannel");
+    fn_close p_close = (fn_close)GetProcAddress(dll, "canClose");
+    DWORD t0, dt;
+    int h;
+    if (!p_open) { fprintf(stderr, "PROBE: timed-open exports missing\n"); return 2; }
+    if (p_init) p_init();
+    t0 = GetTickCount();
+    h = p_open(0, 0);
+    dt = GetTickCount() - t0;
+    printf("PROBE: TIMEDOPEN ms=%lu h=%d\n", (unsigned long)dt, h);
+    fflush(stdout);
+    if (h >= 0 && p_close) p_close(h);
+    FreeLibrary(dll);
+    return 0;
+}
+
+/* --multi-rx <remoteA> <localA> <remoteB> <localB> : open TWO channels in one
+ * process, each pointed at a DIFFERENT cannelloni endpoint, by reloading config
+ * (env) between opens - the shim reads config at each canOpenChannel. Proves
+ * per-channel RX queue isolation in the handle table (kvasilloni-pwx): a frame
+ * delivered to one endpoint must surface only on that channel's canRead, never
+ * the other's. Every RX is printed labelled by channel (RXa/RXb) so the harness
+ * can assert no cross-channel leakage. */
+static int run_multi_rx(HMODULE dll, int argc, char **argv)
+{
+    fn_init   p_init   = (fn_init)  GetProcAddress(dll, "canInitializeLibrary");
+    fn_open   p_open   = (fn_open)  GetProcAddress(dll, "canOpenChannel");
+    fn_setbus p_setbus = (fn_setbus)GetProcAddress(dll, "canSetBusParams");
+    fn_buson  p_buson  = (fn_buson) GetProcAddress(dll, "canBusOn");
+    fn_read   p_read   = (fn_read)  GetProcAddress(dll, "canRead");
+    fn_close  p_close  = (fn_close) GetProcAddress(dll, "canClose");
+    const char *remoteA = (argc > 2) ? argv[2] : "20120";
+    const char *localA  = (argc > 3) ? argv[3] : "20121";
+    const char *remoteB = (argc > 4) ? argv[4] : "20122";
+    const char *localB  = (argc > 5) ? argv[5] : "20123";
+    int ha, hb, loops;
+    if (!p_open || !p_read) { fprintf(stderr, "PROBE: multi-rx exports missing\n"); return 2; }
+    if (p_init) p_init();
+    SetEnvironmentVariableA("KVASILLONI_PROTO", "udp");
+    SetEnvironmentVariableA("KVASILLONI_HOST", "127.0.0.1");
+    /* channel A -> endpoint A */
+    SetEnvironmentVariableA("KVASILLONI_PORT", remoteA);
+    SetEnvironmentVariableA("KVASILLONI_LOCALPORT", localA);
+    ha = p_open(0, 0);
+    /* channel B -> endpoint B (config is re-read at this open) */
+    SetEnvironmentVariableA("KVASILLONI_PORT", remoteB);
+    SetEnvironmentVariableA("KVASILLONI_LOCALPORT", localB);
+    hb = p_open(1, 0);
+    printf("PROBE: MULTIRX ha=%d hb=%d distinct=%d\n",
+           ha, hb, (ha >= 0 && hb >= 0 && ha != hb) ? 1 : 0);
+    fflush(stdout);
+    if (ha < 0 || hb < 0) { fprintf(stderr, "PROBE: a multi-rx open failed\n"); return 3; }
+    if (p_setbus) { p_setbus(ha, 250000, 0, 0, 0, 0, 0); p_setbus(hb, 250000, 0, 0, 0, 0, 0); }
+    if (p_buson)  { p_buson(ha); p_buson(hb); }
+    for (loops = 0; loops < 500; loops++) {
+        long rid; unsigned rdlc, rflag; unsigned long t; unsigned char rbuf[8];
+        if (p_read(ha, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
+            printf("PROBE: RXa id=0x%lX\n", rid); fflush(stdout);
+        }
+        if (p_read(hb, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
+            printf("PROBE: RXb id=0x%lX\n", rid); fflush(stdout);
+        }
+        Sleep(10);
+    }
+    if (p_close) { p_close(ha); p_close(hb); }
+    FreeLibrary(dll);
+    return 0;
+}
+
+/* --stress globals: the worker threads share the resolved entry points. */
+static fn_open   g_st_open;
+static fn_setbus g_st_setbus;
+static fn_buson  g_st_buson;
+static fn_write  g_st_write;
+static fn_read   g_st_read;
+static fn_close  g_st_close;
+static volatile long g_st_iters;
+static volatile long g_st_fail;
+
+/* One stress worker: rapid open -> write/read burst -> close, repeated. Exercises
+ * the mutex-serialized handle table and per-close RX-thread teardown under real
+ * Windows-thread contention (kvasilloni-eoq). */
+static DWORD WINAPI stress_worker(LPVOID arg)
+{
+    long iters = g_st_iters, i, j;
+    (void)arg;
+    for (i = 0; i < iters; i++) {
+        int h = g_st_open(0, 0);
+        if (h < 0) { InterlockedIncrement(&g_st_fail); continue; }
+        if (g_st_setbus) g_st_setbus(h, 250000, 0, 0, 0, 0, 0);
+        if (g_st_buson)  g_st_buson(h);
+        for (j = 0; j < 20; j++) {
+            unsigned char d[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
+            long rid; unsigned rdlc, rflag; unsigned long t; unsigned char rbuf[8];
+            if (g_st_write) g_st_write(h, 0x100 + j, d, 4, canMSG_EXT);
+            if (g_st_read)  g_st_read(h, &rid, rbuf, &rdlc, &rflag, &t);
+        }
+        g_st_close(h);
+    }
+    return 0;
+}
+
+/* --stress <threads> <iters> : drive the shim from N threads concurrently and
+ * report whether every open succeeded and the run completed. The harness bounds
+ * it with `timeout` so a deadlock surfaces as a failure, not a hang. */
+static int run_stress(HMODULE dll, int argc, char **argv)
+{
+    fn_init p_init = (fn_init)GetProcAddress(dll, "canInitializeLibrary");
+    int nthreads = (argc > 2) ? atoi(argv[2]) : 4;
+    int iters    = (argc > 3) ? atoi(argv[3]) : 4;
+    HANDLE th[16];
+    int i;
+    if (nthreads < 1)  nthreads = 1;
+    if (nthreads > 16) nthreads = 16;
+    g_st_open   = (fn_open)  GetProcAddress(dll, "canOpenChannel");
+    g_st_setbus = (fn_setbus)GetProcAddress(dll, "canSetBusParams");
+    g_st_buson  = (fn_buson) GetProcAddress(dll, "canBusOn");
+    g_st_write  = (fn_write) GetProcAddress(dll, "canWrite");
+    g_st_read   = (fn_read)  GetProcAddress(dll, "canRead");
+    g_st_close  = (fn_close) GetProcAddress(dll, "canClose");
+    if (!g_st_open || !g_st_close) { fprintf(stderr, "PROBE: stress exports missing\n"); return 2; }
+    if (p_init) p_init();
+    g_st_iters = iters;
+    g_st_fail = 0;
+    for (i = 0; i < nthreads; i++) th[i] = CreateThread(NULL, 0, stress_worker, NULL, 0, NULL);
+    WaitForMultipleObjects(nthreads, th, TRUE, INFINITE);
+    for (i = 0; i < nthreads; i++) CloseHandle(th[i]);
+    printf("PROBE: STRESS threads=%d iters=%d fail=%ld ok=%d\n",
+           nthreads, iters, g_st_fail, (g_st_fail == 0) ? 1 : 0);
+    fflush(stdout);
+    FreeLibrary(dll);
     return 0;
 }

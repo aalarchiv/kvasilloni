@@ -456,24 +456,58 @@ fn accept_with_timeout(l: &TcpListener, total: Duration) -> std::io::Result<(Tcp
     }
 }
 
+// Test-only fault injection for the RX panic firewall (kvasilloni-uzk/-ehp).
+// With the kkt fix in place nothing in the decode/push path panics on its own,
+// so the `catch_unwind` firewall would otherwise be untested. When armed, the
+// next guarded ingest panics, letting a test prove the firewall contains it.
+// Thread-local so parallel tests don't disturb each other; compiled out of every
+// non-test build, so the shipped DLL carries none of this.
+#[cfg(test)]
+thread_local! {
+    static INJECT_RX_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm a one-shot panic in the next guarded RX ingest on this thread.
+#[cfg(test)]
+fn arm_rx_panic() {
+    INJECT_RX_PANIC.with(|c| c.set(true));
+}
+
+/// Panic exactly once if armed; the only place test fault-injection enters the
+/// guarded ingest path. A no-op (and fully inlined away) in release builds.
+#[cfg(test)]
+#[inline]
+fn rx_panic_hook() {
+    if INJECT_RX_PANIC.with(|c| c.replace(false)) {
+        panic!("injected RX decode panic (kvasilloni-uzk firewall test)");
+    }
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn rx_panic_hook() {}
+
+/// Decode one inbound UDP datagram and enqueue its frames, with any panic in the
+/// untrusted parse/push path contained so a single bad datagram can never kill
+/// the RX thread (kvasilloni-uzk). A panic *inside* the app's extern "system"
+/// notify callback still aborts at the FFI boundary by Rust's rules - that is the
+/// app's contract, not something we can or should resume from. Shared by the loop
+/// and the firewall test (kvasilloni-ehp) so the test exercises the real guard.
+fn guarded_udp_ingest(buf: &[u8], rx: &Arc<Shared>) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        rx_panic_hook(); // no-op outside tests
+        if let Some(frames) = wire::parse_udp(buf) {
+            for f in frames {
+                rx.push(f);
+            }
+        }
+    }));
+}
+
 fn udp_rx_loop(sock: UdpSocket, rx: Arc<Shared>, running: Arc<AtomicBool>) {
     let mut buf = [0u8; 2048];
     while running.load(Ordering::SeqCst) {
         match sock.recv_from(&mut buf) {
-            Ok((n, _from)) => {
-                // Contain any panic in the decode/enqueue path so a single bad
-                // datagram can never kill the RX thread (kvasilloni-uzk). A panic
-                // *inside* the app's extern "system" notify callback aborts at the
-                // FFI boundary by Rust's rules - that is the app's contract, not
-                // something we can or should resume from.
-                let _ = catch_unwind(AssertUnwindSafe(|| {
-                    if let Some(frames) = wire::parse_udp(&buf[..n]) {
-                        for f in frames {
-                            rx.push(f);
-                        }
-                    }
-                }));
-            }
+            Ok((n, _from)) => guarded_udp_ingest(&buf[..n], &rx),
             Err(ref e)
                 if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
             {
@@ -482,6 +516,19 @@ fn udp_rx_loop(sock: UdpSocket, rx: Arc<Shared>, running: Arc<AtomicBool>) {
             Err(_) => break,
         }
     }
+}
+
+/// Decode one TCP stream chunk, containing a decoder panic so a malformed stream
+/// can't kill the RX thread (kvasilloni-uzk). A panic surfaces as `Decoded::Error`
+/// which the loop treats as an unrecoverable stream (a byte stream cannot resync
+/// like independent UDP datagrams can), so the connection tears down cleanly
+/// instead of crashing. Shared with the firewall test (kvasilloni-ehp).
+fn guarded_decode_stream(chunk: &[u8], f: &mut Frame, st: &mut DecodeState) -> Decoded {
+    catch_unwind(AssertUnwindSafe(|| {
+        rx_panic_hook(); // no-op outside tests
+        wire::decode_stream(chunk, f, st)
+    }))
+    .unwrap_or(Decoded::Error)
 }
 
 fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Shared>, running: Arc<AtomicBool>) {
@@ -502,8 +549,7 @@ fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Shared>, running: Arc<AtomicBool>)
         }
         // Contain a decoder panic so a malformed stream can't kill RX
         // (kvasilloni-uzk); decode_stream is the untrusted-parse surface.
-        let decoded = catch_unwind(AssertUnwindSafe(|| wire::decode_stream(&chunk[..need], &mut f, &mut st)))
-            .unwrap_or(Decoded::Error);
+        let decoded = guarded_decode_stream(&chunk[..need], &mut f, &mut st);
         match decoded {
             Decoded::Need(n) => need = n,
             Decoded::Complete => {
@@ -657,6 +703,37 @@ mod tests {
         s.set_notify(test_cb as *const () as usize, 0 /* no NOTIFY_RX */, 0);
         s.push(frame(0x111));
         assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rx_firewall_contains_injected_panic_udp() {
+        // kvasilloni-ehp: with kkt fixed, nothing in the decode/push path panics
+        // on its own, so the catch_unwind firewall (uzk) was never exercised.
+        // Force a panic in the guarded ingest and prove (a) it does not unwind
+        // out of the guard and (b) the RX path keeps delivering afterwards - i.e.
+        // a real RX thread would log-and-continue rather than die.
+        let s = Shared::new();
+        let pkt = wire::build_udp(&frame(0x123), 0);
+
+        arm_rx_panic();
+        guarded_udp_ingest(&pkt, &s); // panics inside the guard; must be contained
+        assert_eq!(s.level(), 0, "panicking ingest must not enqueue");
+
+        // Firewall held: the next valid datagram is still decoded and delivered.
+        guarded_udp_ingest(&pkt, &s);
+        assert_eq!(s.pop().map(|f| f.can_id), Some(0x123));
+    }
+
+    #[test]
+    fn rx_firewall_contains_injected_panic_tcp() {
+        // The TCP decoder is the other untrusted-parse surface. A panic there is
+        // contained and surfaced as Decoded::Error (the loop then tears down the
+        // unresyncable stream) instead of unwinding and killing the RX thread.
+        let mut f = Frame::default();
+        let mut st = DecodeState::Init;
+        arm_rx_panic();
+        let d = guarded_decode_stream(&[0u8; 4], &mut f, &mut st);
+        assert!(matches!(d, Decoded::Error), "panic must surface as Error, not unwind");
     }
 
     #[test]

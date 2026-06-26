@@ -79,12 +79,24 @@ fn log(msg: &str) {
         Some(p) => p,
         None => return,
     };
+    log_to(&LOG_FILE, &path, msg);
+}
+
+/// Append `msg` to the file at `path`, reusing the cached append handle in
+/// `cache` so high-rate logging doesn't reopen the file on every call. The handle
+/// is reopened only when `path` differs from the cached one; on open failure the
+/// cache is cleared so the next call retries (best-effort, never errors out).
+///
+/// Split out of `log()` so the cache contract - reuse, path-change reopen, and
+/// open-failure fallback - is unit-testable against a caller-supplied cache, with
+/// no process-env mutation racing parallel tests (kvasilloni-1gl/-7yl).
+fn log_to(cache: &Mutex<Option<(String, std::fs::File)>>, path: &str, msg: &str) {
     use std::io::Write;
-    let mut guard = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     // (Re)open only when the cache is empty or the configured path changed.
-    if !matches!(guard.as_ref(), Some((p, _)) if *p == path) {
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(f) => *guard = Some((path, f)),
+    if !matches!(guard.as_ref(), Some((p, _)) if p == path) {
+        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(f) => *guard = Some((path.to_string(), f)),
             Err(_) => {
                 *guard = None; // best-effort: drop cache, retry on next call
                 return;
@@ -94,6 +106,15 @@ fn log(msg: &str) {
     if let Some((_, f)) = guard.as_mut() {
         let _ = writeln!(f, "{msg}");
     }
+}
+
+/// Read-once memoization for `canGetNumberOfChannels`: initialize `cell` from
+/// `load` on first use and return that value forever after, so apps that poll the
+/// channel count don't re-hit the disk and the answer can't change mid-run.
+/// Extracted so the read-once contract is unit-testable without mutating the
+/// process env (kvasilloni-1gl/-7yl).
+fn channels_memo(cell: &OnceLock<u32>, load: impl FnOnce() -> u32) -> u32 {
+    *cell.get_or_init(load)
 }
 
 /// Run an export body, converting any panic into `CAN_ERR_PARAM` so it never
@@ -588,8 +609,8 @@ pub extern "system" fn canObjBufSetFilter(
 pub extern "system" fn canGetNumberOfChannels(channel_count: *mut c_int) -> c_int {
     guard(|| {
         // Channel count is static config; read the INI once and memoize so apps
-        // that poll this don't re-hit the disk every call.
-        let n = *ENUM_CHANNELS.get_or_init(|| Config::load().channels) as c_int;
+        // that poll this don't re-hit the disk every call (kvasilloni-7yl).
+        let n = channels_memo(&ENUM_CHANNELS, || Config::load().channels) as c_int;
         unsafe {
             if !channel_count.is_null() {
                 *channel_count = n;
@@ -740,6 +761,141 @@ mod tests {
         assert_eq!(canIoCtl(bad, 10 /* FLUSH_RX */, std::ptr::null_mut(), 0), CAN_ERR_INVHANDLE);
         // Close of an unknown handle is a deliberately lenient no-op.
         assert_eq!(canClose(bad), CAN_OK);
+    }
+
+    // ---- kvasilloni-7yl: log file-handle cache ----
+
+    fn tmp_log_path(tag: &str) -> std::path::PathBuf {
+        // Unique per process + tag so parallel tests never collide; no Date/rand.
+        std::env::temp_dir().join(format!("kvasilloni-log-{}-{tag}.log", std::process::id()))
+    }
+
+    #[test]
+    fn log_cache_reopens_on_path_change() {
+        let pa = tmp_log_path("pc-a");
+        let pb = tmp_log_path("pc-b");
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        let cache = Mutex::new(None);
+
+        log_to(&cache, pa.to_str().unwrap(), "to-a-1");
+        log_to(&cache, pa.to_str().unwrap(), "to-a-2"); // same path -> cached handle
+        log_to(&cache, pb.to_str().unwrap(), "to-b-1"); // path change -> reopen on B
+
+        assert_eq!(std::fs::read_to_string(&pa).unwrap(), "to-a-1\nto-a-2\n");
+        assert_eq!(std::fs::read_to_string(&pb).unwrap(), "to-b-1\n");
+        // Cache now points at B, proving the path change swapped the handle.
+        assert_eq!(cache.lock().unwrap().as_ref().unwrap().0, pb.to_str().unwrap());
+
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+    }
+
+    #[test]
+    fn log_cache_reuses_handle_for_same_path() {
+        // Proof of reuse (not just a matching path string): after the first write
+        // caches the handle, unlink the file. A *retained* handle keeps writing to
+        // the now-unlinked inode, so the path does NOT reappear; a reopen would
+        // recreate it. (Linux unlink-while-open semantics; host tests run on Linux.)
+        let p = tmp_log_path("reuse");
+        let _ = std::fs::remove_file(&p);
+        let cache = Mutex::new(None);
+
+        log_to(&cache, p.to_str().unwrap(), "first");
+        assert!(p.exists(), "first write creates the file");
+        std::fs::remove_file(&p).unwrap();
+        log_to(&cache, p.to_str().unwrap(), "second"); // reuse -> writes to unlinked inode
+        assert!(!p.exists(), "same path reused the cached handle (no reopen recreated it)");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn log_cache_falls_back_on_open_failure() {
+        // An unopenable path (a directory) must not poison the cache: it is left
+        // empty and a later valid path still logs.
+        let bad = std::env::temp_dir(); // a directory: cannot open for append
+        let good = tmp_log_path("recover");
+        let _ = std::fs::remove_file(&good);
+        let cache = Mutex::new(None);
+
+        log_to(&cache, bad.to_str().unwrap(), "nope");
+        assert!(cache.lock().unwrap().is_none(), "open failure leaves the cache empty");
+
+        log_to(&cache, good.to_str().unwrap(), "recovered");
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "recovered\n");
+        let _ = std::fs::remove_file(&good);
+    }
+
+    // ---- kvasilloni-7yl: channel-count memoization ----
+
+    #[test]
+    fn channels_memo_reads_once() {
+        // The count is read once and returned consistently: a fresh cell takes the
+        // first loader's value, and a later loader must never run, so a runtime
+        // config change cannot alter an already-answered count. Local cell -> no
+        // process-env mutation racing other parallel tests.
+        let cell = OnceLock::new();
+        assert_eq!(channels_memo(&cell, || 3), 3);
+        let mut ran_again = false;
+        let n = channels_memo(&cell, || {
+            ran_again = true;
+            7
+        });
+        assert_eq!(n, 3, "memoized value returned, not re-read");
+        assert!(!ran_again, "loader ran twice: count was not memoized");
+    }
+
+    // ---- kvasilloni-eoq: concurrency / stress ----
+
+    #[test]
+    fn stress_concurrent_open_write_read_close() {
+        // Drive the handle table from many threads at once - rapid open/close plus
+        // a burst of write/read on each channel - to prove the mutex-serialized
+        // table (kvasilloni-j83) and the RX-thread teardown (hc9/cqe) hold under
+        // contention: no deadlock, no crash, no leaked handles. UDP opens succeed
+        // with no cannelloni (they just bind a socket and spawn the RX loop);
+        // writes go nowhere and reads return NOMSG. Bounded modestly because each
+        // close joins an RX thread parked on a 500ms read timeout.
+        const THREADS: i32 = 8;
+        const OUTER: i32 = 6; // open/close cycles per thread
+        const INNER: i32 = 40; // write/read ops per open
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for o in 0..OUTER {
+                        let h = canOpenChannel(0, 0);
+                        assert!(h > 0, "open failed on thread {t}: {h}");
+                        canBusOn(h);
+                        let mut data = [t as u8, o as u8, 0xAA, 0xBB];
+                        let mut id: c_long = 0;
+                        let (mut dlc, mut flag): (c_uint, c_uint) = (0, 0);
+                        let mut time: c_ulong = 0;
+                        for i in 0..INNER {
+                            canWrite(h, 0x100 + i as c_long, data.as_mut_ptr() as *mut c_void, 4, 0);
+                            // non-blocking read: usually NOMSG, must never hang/crash
+                            let _ = canRead(
+                                h,
+                                &mut id,
+                                std::ptr::null_mut(),
+                                &mut dlc,
+                                &mut flag,
+                                &mut time,
+                            );
+                        }
+                        assert_eq!(canClose(h), CAN_OK);
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().expect("a stress worker thread panicked (deadlock/crash)");
+        }
+        // No leaked handles: every channel opened was removed on close.
+        assert!(
+            CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "handle table leaked channels after the stress run"
+        );
     }
 
     #[test]

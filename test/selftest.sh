@@ -320,6 +320,164 @@ else
   echo "  SKIP: python3 not available for raw UDP injection"
 fi
 
+# ===================== timeout + role coverage (epic kvasilloni-nzp) =====================
+# Helpers to pull the two fields out of the probe's "TIMEDOPEN ms=.. h=.." line.
+parse_ms() { sed -n 's/.*TIMEDOPEN ms=\([0-9]*\).*/\1/p' "$1"; }
+parse_h()  { sed -n 's/.*TIMEDOPEN .*h=\(-\{0,1\}[0-9]*\).*/\1/p' "$1"; }
+
+# --- connect/handshake timeout fast-fail (kvasilloni-7yl) ---
+# A TCP client open against a peer that accepts but never sends the CANNELLONIv1
+# banner blocks in the handshake read, which is bounded by connecttimeout. Assert
+# the open fails in ~connecttimeout (1.5s), not the 5s default. Needs python3 for
+# a silent listener (accept + hold, send nothing).
+echo; echo "===== CASE: TCP connect/handshake timeout fast-fail (kvasilloni-7yl) ====="
+if command -v python3 >/dev/null 2>&1; then
+  ct_out="$(mktemp)"
+  python3 - 20140 >/dev/null 2>&1 <<'PY' & SILENT=$!; PIDS+=("$SILENT")
+import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(4)
+conns, end = [], time.time() + 20
+while time.time() < end:
+    s.settimeout(1.0)
+    try:
+        c, _ = s.accept(); conns.append(c)   # accept but never send the banner
+    except socket.timeout:
+        pass
+PY
+  sleep 0.7
+  ( cd "$BUILD" && KVASILLONI_PROTO=tcp KVASILLONI_TCPROLE=client KVASILLONI_HOST=127.0.0.1 \
+      KVASILLONI_PORT=20140 KVASILLONI_CONNECT_TIMEOUT=1500 \
+      timeout 20 wine ./canshim_probe.exe --timed-open ) > "$ct_out" 2>/dev/null
+  kill "$SILENT" 2>/dev/null
+  ms="$(parse_ms "$ct_out")"; h="$(parse_h "$ct_out")"
+  echo "  open: ms=${ms:-?} h=${h:-?} (connecttimeout=1500, default would be 5000)"
+  if [ -n "$ms" ] && [ "$ms" -ge 1000 ] && [ "$ms" -le 4000 ] && [ -n "$h" ] && [ "$h" -lt 0 ]; then
+    echo "  PASS: client open fast-failed in ~connecttimeout (well under the 5s default)"
+  else
+    echo "  FAIL: connect timeout not honored"; sed 's/^/    /' "$ct_out"; FAIL=1
+  fi
+  rm -f "$ct_out"
+else
+  echo "  SKIP: python3 not available for the silent TCP listener"
+fi
+
+# --- TCP server role: shim listens, cannelloni connects as client (kvasilloni-6ot) ---
+# The probe must be up and blocked in accept() BEFORE cannelloni dials in, so we
+# start it first (unlike run_case). Both data directions are then exercised.
+echo; echo "===== CASE: TCP server role (shim listens, cannelloni client) ====="
+srv_cap="$(mktemp)"; srv_out="$(mktemp)"
+candump -L "$VCAN" > "$srv_cap" 2>/dev/null & SRVCD=$!; PIDS+=("$SRVCD")
+( cd "$BUILD" && KVASILLONI_PROTO=tcp KVASILLONI_TCPROLE=server KVASILLONI_LOCALPORT=20142 \
+    KVASILLONI_ACCEPT_TIMEOUT=8000 \
+    wine ./canshim_probe.exe 0x18EEFF40 ext 5A 5B ) > "$srv_out" 2>/dev/null & SRVPB=$!; PIDS+=("$SRVPB")
+sleep 1.5   # let the probe bind its listener and enter accept()
+"$CANNBIN" -C c -R 127.0.0.1 -r 20142 -p -I "$VCAN" >/dev/null 2>&1 & SRVCN=$!; PIDS+=("$SRVCN")
+sleep 2.0
+cansend "$VCAN" "18FF0140#42" 2>/dev/null
+echo "  injected: 18FF0140 (to shim via cannelloni client)"
+wait "$SRVPB" 2>/dev/null
+sleep 0.4
+kill "$SRVCN" "$SRVCD" 2>/dev/null
+sleep 0.8
+if grep -qiE "18EEFF40" "$srv_cap"; then
+  echo "  PASS: probe TX (server) reached $VCAN via the cannelloni client"
+else
+  echo "  FAIL: probe TX not seen on $VCAN"; echo "  --- candump ---"; sed 's/^/    /' "$srv_cap"
+  echo "  --- probe ---"; sed 's/^/    /' "$srv_out"; FAIL=1
+fi
+if grep -qE "RX id=0x18FF0140" "$srv_out"; then
+  echo "  PASS: injected frame delivered to probe canRead (server RX)"
+else
+  echo "  FAIL: probe did not receive injected frame (server RX)"; sed 's/^/    /' "$srv_out"; FAIL=1
+fi
+rm -f "$srv_cap" "$srv_out"
+
+# --- TCP server accept timeout with no client (kvasilloni-6ot) ---
+# A server open with no client must time out in ~accepttimeout and fail, not hang.
+echo; echo "===== CASE: TCP server accept timeout (no client) ====="
+to_out="$(mktemp)"
+( cd "$BUILD" && KVASILLONI_PROTO=tcp KVASILLONI_TCPROLE=server KVASILLONI_LOCALPORT=20144 \
+    KVASILLONI_ACCEPT_TIMEOUT=1500 \
+    timeout 20 wine ./canshim_probe.exe --timed-open ) > "$to_out" 2>/dev/null
+ms="$(parse_ms "$to_out")"; h="$(parse_h "$to_out")"
+echo "  open: ms=${ms:-?} h=${h:-?} (accepttimeout=1500)"
+if [ -n "$ms" ] && [ "$ms" -ge 1000 ] && [ "$ms" -le 4000 ] && [ -n "$h" ] && [ "$h" -lt 0 ]; then
+  echo "  PASS: server open with no client failed in ~accepttimeout"
+else
+  echo "  FAIL: accept timeout not honored"; sed 's/^/    /' "$to_out"; FAIL=1
+fi
+rm -f "$to_out"
+
+# --- per-channel RX isolation, two endpoints (kvasilloni-pwx) ---
+# Two cannelloni instances on two isolated vcans, one per shim channel. A frame
+# injected on $VCAN must reach ONLY channel A's canRead; one on $VCAN2 ONLY
+# channel B's - proving the handle table keeps per-channel RX queues isolated.
+echo; echo "===== CASE: per-channel RX isolation (--multi-rx, two endpoints) ====="
+VCAN2="${SELFTEST_VCAN2:-vcan2}"
+pwx_ok=1
+if ! ip link show "$VCAN2" >/dev/null 2>&1; then
+  $SUDO modprobe vcan 2>/dev/null
+  $SUDO ip link add dev "$VCAN2" type vcan 2>/dev/null || pwx_ok=0
+fi
+$SUDO ip link set "$VCAN2" mtu 72 2>/dev/null || true
+$SUDO ip link set up "$VCAN2" 2>/dev/null || pwx_ok=0
+if [ "$pwx_ok" = 1 ]; then
+  mrx_out="$(mktemp)"
+  # endpoint A on $VCAN: listens 20120 (shim TX), sends RX to 20121 (channel A)
+  "$CANNBIN" -I "$VCAN"  -R 127.0.0.1 -r 20121 -l 20120 >/dev/null 2>&1 & MRXA=$!; PIDS+=("$MRXA")
+  # endpoint B on $VCAN2: listens 20122 (shim TX), sends RX to 20123 (channel B)
+  "$CANNBIN" -I "$VCAN2" -R 127.0.0.1 -r 20123 -l 20122 >/dev/null 2>&1 & MRXB=$!; PIDS+=("$MRXB")
+  sleep 1.0
+  ( cd "$BUILD" && wine ./canshim_probe.exe --multi-rx 20120 20121 20122 20123 ) \
+      > "$mrx_out" 2>/dev/null & MRXPB=$!; PIDS+=("$MRXPB")
+  sleep 2.0
+  cansend "$VCAN"  "18FF01A0#A1" 2>/dev/null   # -> endpoint A -> channel A only
+  cansend "$VCAN2" "18FF01B0#B1" 2>/dev/null   # -> endpoint B -> channel B only
+  echo "  injected: 18FF01A0 on $VCAN (chan A), 18FF01B0 on $VCAN2 (chan B)"
+  wait "$MRXPB" 2>/dev/null
+  kill "$MRXA" "$MRXB" 2>/dev/null
+  sleep 0.8
+  if grep -qE "MULTIRX .*distinct=1" "$mrx_out"; then
+    echo "  PASS: two channels opened with distinct handles"
+  else
+    echo "  FAIL: distinct handles not reported"; sed 's/^/    /' "$mrx_out"; FAIL=1
+  fi
+  if grep -qE "RXa id=0x18FF01A0" "$mrx_out" && ! grep -qE "RXa id=0x18FF01B0" "$mrx_out"; then
+    echo "  PASS: channel A received only its own frame (no leak from B)"
+  else
+    echo "  FAIL: channel A RX isolation broken"; sed 's/^/    /' "$mrx_out"; FAIL=1
+  fi
+  if grep -qE "RXb id=0x18FF01B0" "$mrx_out" && ! grep -qE "RXb id=0x18FF01A0" "$mrx_out"; then
+    echo "  PASS: channel B received only its own frame (no leak from A)"
+  else
+    echo "  FAIL: channel B RX isolation broken"; sed 's/^/    /' "$mrx_out"; FAIL=1
+  fi
+  rm -f "$mrx_out"
+else
+  echo "  SKIP: could not create a second vcan ($VCAN2) for the two-endpoint test"
+fi
+
+# --- concurrency / stress, real DLL (kvasilloni-eoq) ---
+# Hammer the shim from several wine threads at once (rapid open/close + write/read)
+# over UDP with no cannelloni. `timeout` bounds a hang so a deadlock fails the test
+# rather than stalling the suite. The host-side `cargo test` proves no handle leak;
+# this proves the shipped DLL survives the real Windows threading model.
+echo; echo "===== CASE: concurrency stress, real DLL (--stress) ====="
+st_out="$(mktemp)"
+( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20130 KVASILLONI_LOCALPORT=20131 \
+    timeout 40 wine ./canshim_probe.exe --stress 4 4 ) > "$st_out" 2>/dev/null
+st_rc=$?
+if [ "$st_rc" = 124 ]; then
+  echo "  FAIL: stress run timed out (possible deadlock)"; sed 's/^/    /' "$st_out"; FAIL=1
+elif grep -qE "STRESS .*ok=1" "$st_out"; then
+  echo "  PASS: concurrent open/write/read/close from 4 threads completed cleanly"
+else
+  echo "  FAIL: stress run did not report ok"; sed 's/^/    /' "$st_out"; FAIL=1
+fi
+rm -f "$st_out"
+
 echo
 if [ "$FAIL" = 0 ]; then echo "SELFTEST: PASS"; else echo "SELFTEST: FAIL"; fi
 exit "$FAIL"

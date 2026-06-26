@@ -64,7 +64,8 @@ your-can-app.exe
 make verify                # all exports present + undecorated
 make test                  # wire-codec + ring/notify/export unit tests
 make selftest              # full loopback over vcan1: classic UDP/TCP, CAN FD, INI,
-                           #   enumeration, acceptance filtering, notify callbacks
+                           #   enumeration, acceptance filtering, notify callbacks,
+                           #   TCP server role + timeouts, per-channel RX isolation, stress
 ```
 
 ## Scope
@@ -211,7 +212,7 @@ transport-protocol messages).
 `make selftest` runs a full loopback on this Linux host using an **isolated
 `vcan1`** (so it never disturbs anything on `vcan0`). It builds cannelloni,
 launches a small probe under **wine** that loads the shim, and asserts that frames
-cross **both directions** for four scenarios:
+cross **both directions**, plus the robustness/retargeting paths:
 
 ```
 make selftest
@@ -219,8 +220,18 @@ make selftest
 # CASE: TCP (classic)        PASS (TX + RX)
 # CASE: UDP (CAN FD + BRS)   PASS (TX + RX)
 # CASE: UDP (INI config, no env)  PASS (TX + RX)
+# CASE: channel enumeration / acceptance filter / notify callback  PASS
+# CASE: close from notify callback / RX survives malformed UDP     PASS
+# CASE: TCP connect/handshake timeout fast-fail                    PASS
+# CASE: TCP server role (shim listens, cannelloni client)          PASS (TX + RX)
+# CASE: TCP server accept timeout (no client)                      PASS
+# CASE: per-channel RX isolation (two endpoints, no cross-leak)    PASS
+# CASE: concurrency stress, real DLL (4 threads)                   PASS
 # SELFTEST: PASS
 ```
+
+The two-endpoint isolation case also brings up an isolated `vcan2`. Run the same
+suite against the 64-bit DLL with `make selftest64` (wine wow64).
 
 (Needs `wine`, `can-utils`, `cmake`/`g++`, and permission to create a vcan link.)
 
