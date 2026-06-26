@@ -24,10 +24,11 @@ mod config;
 mod transport;
 mod wire;
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_ushort};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -40,6 +41,7 @@ const CAN_OK: c_int = 0;
 const CAN_ERR_PARAM: c_int = -1;
 const CAN_ERR_NOMSG: c_int = -2;
 const CAN_ERR_NOTFOUND: c_int = -3;
+const CAN_ERR_INVHANDLE: c_int = -10; // canERR_INVHANDLE: handle not an open channel
 const CAN_ERR_NOT_IMPLEMENTED: c_int = -32;
 
 /// `canDRIVER_NORMAL` (canlib.h): default output-control driver type.
@@ -47,8 +49,16 @@ const CAN_DRIVER_NORMAL: u32 = 4;
 /// `canWAIT_INFINITE` sentinel for the blocking-I/O timeout arguments (ms).
 const CAN_WAIT_INFINITE: c_ulong = 0xFFFF_FFFF;
 
-/// Single channel; the target app opens exactly one.
-static CONN: Mutex<Option<Conn>> = Mutex::new(None);
+/// Open channels keyed by the handle `canOpenChannel` returned. A `BTreeMap` so
+/// the static is const-initializable without `LazyLock`; the channel count is
+/// tiny. Each API call resolves its `hnd` here, so an app that opens several
+/// channels (e.g. one per thread) gets isolated connections instead of all
+/// sharing - or clobbering - one global. All channels still bridge to the same
+/// configured cannelloni endpoint. See kvasilloni-j83.
+static CONNS: Mutex<BTreeMap<c_int, Conn>> = Mutex::new(BTreeMap::new());
+/// Next handle to hand out. Kvaser handles are non-negative; we start at 1 and
+/// never reuse, so a stale handle from a closed channel fails lookup cleanly.
+static NEXT_HANDLE: AtomicI32 = AtomicI32::new(1);
 /// Log path resolved from config at canOpenChannel (env `KVASILLONI_LOG` still wins).
 static LOG_PATH: Mutex<Option<String>> = Mutex::new(None);
 /// Last value passed to `canSetBusOutputControl`; returned by the getter.
@@ -103,8 +113,10 @@ pub extern "system" fn canOpenChannel(channel: c_int, flags: c_int) -> c_int {
                         cfg.local_port
                     ));
                 }
-                *CONN.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
-                1 // fixed non-negative handle
+                let hnd = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
+                CONNS.lock().unwrap_or_else(|e| e.into_inner()).insert(hnd, c);
+                log(&format!("canOpenChannel -> handle {hnd}"));
+                hnd // distinct non-negative handle per open channel
             }
             Err(e) => {
                 log(&format!("canOpenChannel: connect failed: {e}"));
@@ -145,18 +157,19 @@ pub extern "system" fn canBusOff(_hnd: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "system" fn canWrite(
-    _hnd: c_int,
+    hnd: c_int,
     id: c_long,
     msg: *mut c_void,
     dlc: c_uint,
     flag: c_uint,
 ) -> c_int {
-    guard(|| write_frame(id, msg, dlc, flag))
+    guard(|| write_frame(hnd, id, msg, dlc, flag))
 }
 
-/// Encode and send a single frame. Shared by `canWrite` and `canWriteWait`
-/// (the shim sends synchronously, so there is no separate queued path).
-fn write_frame(id: c_long, msg: *mut c_void, dlc: c_uint, flag: c_uint) -> c_int {
+/// Encode and send a single frame on channel `hnd`. Shared by `canWrite` and
+/// `canWriteWait` (the shim sends synchronously, so there is no separate queued
+/// path).
+fn write_frame(hnd: c_int, id: c_long, msg: *mut c_void, dlc: c_uint, flag: c_uint) -> c_int {
     {
         let mut f = Frame::default();
         f.can_id = wire::kvaser_to_canid(id as i32, flag as u32);
@@ -177,10 +190,10 @@ fn write_frame(id: c_long, msg: *mut c_void, dlc: c_uint, flag: c_uint) -> c_int
             let src = unsafe { std::slice::from_raw_parts(msg as *const u8, user_bytes) };
             f.data[..user_bytes].copy_from_slice(src);
         }
-        let guard = CONN.lock().unwrap_or_else(|e| e.into_inner());
-        let r = match guard.as_ref() {
+        let guard = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        let r = match guard.get(&hnd) {
             Some(c) => c.write(&f),
-            None => return CAN_ERR_PARAM,
+            None => return CAN_ERR_INVHANDLE,
         };
         match r {
             Ok(()) => {
@@ -197,7 +210,7 @@ fn write_frame(id: c_long, msg: *mut c_void, dlc: c_uint, flag: c_uint) -> c_int
 
 #[no_mangle]
 pub extern "system" fn canRead(
-    _hnd: c_int,
+    hnd: c_int,
     id: *mut c_long,
     msg: *mut c_void,
     dlc: *mut c_uint,
@@ -206,10 +219,10 @@ pub extern "system" fn canRead(
 ) -> c_int {
     guard(|| {
         let frame = {
-            let g = CONN.lock().unwrap_or_else(|e| e.into_inner());
-            match g.as_ref() {
+            let g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+            match g.get(&hnd) {
                 Some(c) => c.read(),
-                None => return CAN_ERR_PARAM,
+                None => return CAN_ERR_INVHANDLE,
             }
         };
         let f = match frame {
@@ -333,12 +346,18 @@ pub extern "system" fn canGetErrorText(err: c_int, buf: *mut c_char, bufsiz: c_u
 }
 
 #[no_mangle]
-pub extern "system" fn canClose(_hnd: c_int) -> c_int {
+pub extern "system" fn canClose(hnd: c_int) -> c_int {
     guard(|| {
-        log("canClose");
-        if let Some(mut c) = CONN.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        log(&format!("canClose(hnd={hnd})"));
+        // Remove under the lock, then close() outside it: close() joins the RX
+        // thread (up to the 500ms UDP read timeout) and we must not hold the
+        // global map lock - and thus stall every other channel - while it does.
+        let conn = CONNS.lock().unwrap_or_else(|e| e.into_inner()).remove(&hnd);
+        if let Some(mut c) = conn {
             c.close();
         }
+        // Closing an unknown/already-closed handle is a benign no-op (lenient so
+        // double-close cleanup paths in lower-quality apps don't error).
         CAN_OK
     })
 }
@@ -348,11 +367,11 @@ pub extern "system" fn canClose(_hnd: c_int) -> c_int {
 // shim can stand in for other CANlib apps whose import tables resolve them (see
 // AGENTS.md coverage-check procedure). Implemented under epic kvasilloni-5yp.
 
-/// Run `f` with the live connection, holding the `CONN` lock for the call, or
-/// return `err` when no channel is open. Only for non-blocking operations.
-fn with_conn<F: FnOnce(&Conn) -> c_int>(err: c_int, f: F) -> c_int {
-    let g = CONN.lock().unwrap_or_else(|e| e.into_inner());
-    match g.as_ref() {
+/// Run `f` with the connection for `hnd`, holding the `CONNS` lock for the call,
+/// or return `err` when no such channel is open. Only for non-blocking ops.
+fn with_conn<F: FnOnce(&Conn) -> c_int>(hnd: c_int, err: c_int, f: F) -> c_int {
+    let g = CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    match g.get(&hnd) {
         Some(c) => f(c),
         None => err,
     }
@@ -393,10 +412,10 @@ fn out_cstr(buf: *mut c_void, bufsize: usize, s: &str) -> c_int {
 // ---- kvasilloni-qaq: queue flushing ----
 
 #[no_mangle]
-pub extern "system" fn canFlushReceiveQueue(_hnd: c_int) -> c_int {
+pub extern "system" fn canFlushReceiveQueue(hnd: c_int) -> c_int {
     guard(|| {
         log("canFlushReceiveQueue");
-        with_conn(CAN_ERR_PARAM, |c| {
+        with_conn(hnd, CAN_ERR_INVHANDLE, |c| {
             c.clear_rx();
             CAN_OK
         })
@@ -434,7 +453,7 @@ pub extern "system" fn canGetBusOutputControl(_hnd: c_int, drivertype: *mut c_ui
 
 #[no_mangle]
 pub extern "system" fn canReadWait(
-    _hnd: c_int,
+    hnd: c_int,
     id: *mut c_long,
     msg: *mut c_void,
     dlc: *mut c_uint,
@@ -443,10 +462,10 @@ pub extern "system" fn canReadWait(
     timeout: c_ulong,
 ) -> c_int {
     guard(|| {
-        // Take a clone of the RX state and release CONN before blocking.
-        let shared = match CONN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        // Take a clone of the RX state and release CONNS before blocking.
+        let shared = match CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd) {
             Some(c) => c.rx_shared(),
-            None => return CAN_ERR_PARAM,
+            None => return CAN_ERR_INVHANDLE,
         };
         match shared.pop_wait(timeout_to_duration(timeout)) {
             Some(f) => {
@@ -459,11 +478,11 @@ pub extern "system" fn canReadWait(
 }
 
 #[no_mangle]
-pub extern "system" fn canReadSync(_hnd: c_int, timeout: c_ulong) -> c_int {
+pub extern "system" fn canReadSync(hnd: c_int, timeout: c_ulong) -> c_int {
     guard(|| {
-        let shared = match CONN.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        let shared = match CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd) {
             Some(c) => c.rx_shared(),
-            None => return CAN_ERR_PARAM,
+            None => return CAN_ERR_INVHANDLE,
         };
         if shared.peek_wait(timeout_to_duration(timeout)) {
             CAN_OK
@@ -475,7 +494,7 @@ pub extern "system" fn canReadSync(_hnd: c_int, timeout: c_ulong) -> c_int {
 
 #[no_mangle]
 pub extern "system" fn canWriteWait(
-    _hnd: c_int,
+    hnd: c_int,
     id: c_long,
     msg: *mut c_void,
     dlc: c_uint,
@@ -483,7 +502,7 @@ pub extern "system" fn canWriteWait(
     _timeout: c_ulong,
 ) -> c_int {
     // We already send synchronously, so the timeout is irrelevant.
-    guard(|| write_frame(id, msg, dlc, flag))
+    guard(|| write_frame(hnd, id, msg, dlc, flag))
 }
 
 #[no_mangle]
@@ -495,7 +514,7 @@ pub extern "system" fn canWriteSync(_hnd: c_int, _timeout: c_ulong) -> c_int {
 
 #[no_mangle]
 pub extern "system" fn canIoCtl(
-    _hnd: c_int,
+    hnd: c_int,
     func: c_uint,
     buf: *mut c_void,
     buflen: c_uint,
@@ -504,14 +523,14 @@ pub extern "system" fn canIoCtl(
         log(&format!("canIoCtl(func={func}, buflen={buflen})"));
         let len = buflen as usize;
         match func {
-            10 => with_conn(CAN_ERR_PARAM, |c| {
+            10 => with_conn(hnd, CAN_ERR_INVHANDLE, |c| {
                 c.clear_rx();
                 CAN_OK
             }), // canIOCTL_FLUSH_RX_BUFFER
             11 => CAN_OK,                       // canIOCTL_FLUSH_TX_BUFFER (synchronous TX)
             6 | 7 | 13 => CAN_OK,               // SET_TIMER_SCALE / SET_TXACK / SET_TXRQ: accept
             12 => out_u32(buf, len, 1000),      // canIOCTL_GET_TIMER_SCALE (us/tick)
-            8 => with_conn(CAN_ERR_PARAM, |c| out_u32(buf, len, c.rx_level() as u32)), // GET_RX_BUFFER_LEVEL
+            8 => with_conn(hnd, CAN_ERR_INVHANDLE, |c| out_u32(buf, len, c.rx_level() as u32)), // GET_RX_BUFFER_LEVEL
             9 => out_u32(buf, len, 0),          // canIOCTL_GET_TX_BUFFER_LEVEL
             _ => CAN_ERR_NOT_IMPLEMENTED,
         }
@@ -521,10 +540,10 @@ pub extern "system" fn canIoCtl(
 // ---- kvasilloni-guu: acceptance filtering ----
 
 #[no_mangle]
-pub extern "system" fn canAccept(_hnd: c_int, envelope: c_long, flag: c_uint) -> c_int {
+pub extern "system" fn canAccept(hnd: c_int, envelope: c_long, flag: c_uint) -> c_int {
     guard(|| {
         log(&format!("canAccept(envelope={envelope:#x}, flag={flag})"));
-        with_conn(CAN_ERR_PARAM, |c| {
+        with_conn(hnd, CAN_ERR_INVHANDLE, |c| {
             c.set_accept(flag as u32, envelope as u32);
             CAN_OK
         })
@@ -587,7 +606,7 @@ pub extern "system" fn canGetChannelData(
 
 #[no_mangle]
 pub extern "system" fn canSetNotify(
-    _hnd: c_int,
+    hnd: c_int,
     callback: *const c_void,
     notify_flags: c_uint,
     tag: *mut c_void,
@@ -597,7 +616,7 @@ pub extern "system" fn canSetNotify(
             "canSetNotify(flags={notify_flags:#x}, cb={})",
             if callback.is_null() { "null" } else { "set" }
         ));
-        with_conn(CAN_ERR_PARAM, |c| {
+        with_conn(hnd, CAN_ERR_INVHANDLE, |c| {
             c.set_notify(callback as usize, notify_flags as u32, tag as usize);
             CAN_OK
         })
@@ -655,6 +674,50 @@ mod tests {
 
         // unknown item -> CAN_ERR_PARAM
         assert_eq!(canGetChannelData(2, 9999, p, buf.len()), CAN_ERR_PARAM);
+    }
+
+    #[test]
+    fn ops_on_unknown_handle_report_invhandle() {
+        // No channel is open in the unit-test env (no network). Every data/control
+        // op on a handle that was never returned must report INVHANDLE - not
+        // panic, and not touch a stale shared connection. Regression for the
+        // handle-table refactor (kvasilloni-j83); negative handles are never
+        // handed out (allocation starts at 1).
+        let bad: c_int = -999;
+        assert_eq!(
+            canRead(
+                bad,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            CAN_ERR_INVHANDLE
+        );
+        assert_eq!(canWrite(bad, 0x123, std::ptr::null_mut(), 0, 0), CAN_ERR_INVHANDLE);
+        assert_eq!(
+            canReadWait(
+                bad,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            ),
+            CAN_ERR_INVHANDLE
+        );
+        assert_eq!(canReadSync(bad, 0), CAN_ERR_INVHANDLE);
+        assert_eq!(canFlushReceiveQueue(bad), CAN_ERR_INVHANDLE);
+        assert_eq!(canAccept(bad, 0, 0), CAN_ERR_INVHANDLE);
+        assert_eq!(
+            canSetNotify(bad, std::ptr::null(), 0, std::ptr::null_mut()),
+            CAN_ERR_INVHANDLE
+        );
+        assert_eq!(canIoCtl(bad, 10 /* FLUSH_RX */, std::ptr::null_mut(), 0), CAN_ERR_INVHANDLE);
+        // Close of an unknown handle is a deliberately lenient no-op.
+        assert_eq!(canClose(bad), CAN_OK);
     }
 
     #[test]

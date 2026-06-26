@@ -62,6 +62,7 @@ static void __stdcall notify_cb(notify_data *d) {
 static int run_enum(HMODULE dll);
 static int run_accept(HMODULE dll, int argc, char **argv);
 static int run_notify(HMODULE dll, int argc, char **argv);
+static int run_multi(HMODULE dll, int argc, char **argv);
 
 int main(int argc, char **argv)
 {
@@ -93,6 +94,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--enum"))   return run_enum(dll);
     if (argc > 1 && !strcmp(argv[1], "--accept")) return run_accept(dll, argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--notify")) return run_notify(dll, argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--multi"))  return run_multi(dll, argc, argv);
 
 #define GET(v, t, n) v = (t)GetProcAddress(dll, n); \
     if (!v) { fprintf(stderr, "PROBE: missing export %s\n", n); return 2; }
@@ -225,6 +227,52 @@ static int run_notify(HMODULE dll, int argc, char **argv)
     printf("PROBE: NOTIFY count=%ld\n", g_notify_count);
     fflush(stdout);
     if (p_close) p_close(h);
+    FreeLibrary(dll);
+    return 0;
+}
+
+/* --multi <hex_id_a> <hex_id_b> : open TWO channels in one process, verify the
+ * handles are distinct + non-negative, TX on both, and that the first channel
+ * (bound to the configured local port cannelloni replies to) still receives.
+ * Exercises the handle table (kvasilloni-j83) and the UDP ephemeral-port
+ * fallback for the second open (kvasilloni-iai) together. */
+static int run_multi(HMODULE dll, int argc, char **argv)
+{
+    fn_init  p_init  = (fn_init) GetProcAddress(dll, "canInitializeLibrary");
+    fn_open  p_open  = (fn_open) GetProcAddress(dll, "canOpenChannel");
+    fn_setbus p_setbus = (fn_setbus)GetProcAddress(dll, "canSetBusParams");
+    fn_buson p_buson = (fn_buson)GetProcAddress(dll, "canBusOn");
+    fn_write p_write = (fn_write)GetProcAddress(dll, "canWrite");
+    fn_read  p_read  = (fn_read) GetProcAddress(dll, "canRead");
+    fn_close p_close = (fn_close)GetProcAddress(dll, "canClose");
+    long ida = (argc > 2) ? strtol(argv[2], NULL, 0) : 0x18EEFF10;
+    long idb = (argc > 3) ? strtol(argv[3], NULL, 0) : 0x18EEFF11;
+    unsigned char d[2] = { 0xAA, 0xBB };
+    int ha, hb, loops;
+    if (!p_open || !p_write || !p_read) { fprintf(stderr, "PROBE: multi exports missing\n"); return 2; }
+    if (p_init) p_init();
+    ha = p_open(0, 0);
+    hb = p_open(1, 0);  /* second open: configured UDP port is busy -> ephemeral */
+    printf("PROBE: MULTI ha=%d hb=%d distinct=%d\n",
+           ha, hb, (ha >= 0 && hb >= 0 && ha != hb) ? 1 : 0);
+    fflush(stdout);
+    if (ha < 0 || hb < 0) { fprintf(stderr, "PROBE: a multi open failed\n"); return 3; }
+    if (p_setbus) { p_setbus(ha, 250000, 0, 0, 0, 0, 0); p_setbus(hb, 250000, 0, 0, 0, 0, 0); }
+    if (p_buson) { p_buson(ha); p_buson(hb); }
+    Sleep(300);
+    printf("PROBE: TXa id=0x%lX -> st=%d\n", ida, p_write(ha, ida, d, 2, canMSG_EXT));
+    printf("PROBE: TXb id=0x%lX -> st=%d\n", idb, p_write(hb, idb, d, 2, canMSG_EXT));
+    fflush(stdout);
+    for (loops = 0; loops < 500; loops++) {
+        long rid; unsigned rdlc, rflag; unsigned long t; unsigned char rbuf[8];
+        if (p_read(ha, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
+            printf("PROBE: RXa id=0x%lX dlc=%u\n", rid, rdlc);
+            fflush(stdout);
+        } else {
+            Sleep(10);
+        }
+    }
+    if (p_close) { p_close(ha); p_close(hb); }
     FreeLibrary(dll);
     return 0;
 }

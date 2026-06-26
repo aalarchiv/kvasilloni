@@ -217,6 +217,44 @@ else
 fi
 rm -f "$not_out"
 
+# --- multi-channel (handle table + ephemeral fallback): two channels, one app ---
+# One process opens two UDP channels. The 2nd open hits the busy configured port
+# and falls back to an ephemeral one (kvasilloni-iai); both must get distinct,
+# usable handles (kvasilloni-j83). cannelloni replies to the configured port, so
+# the first channel receives the injected frame.
+echo; echo "===== CASE: multi-channel (--multi, UDP) ====="
+multi_cap="$(mktemp)"; multi_out="$(mktemp)"
+candump -L "$VCAN" > "$multi_cap" 2>/dev/null & MCDPID=$!; PIDS+=("$MCDPID")
+"$CANNBIN" -I "$VCAN" -R 127.0.0.1 -r 20113 -l 20112 >/dev/null 2>&1 & MCNPID=$!; PIDS+=("$MCNPID")
+sleep 1.0
+( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20112 KVASILLONI_LOCALPORT=20113 \
+    wine ./canshim_probe.exe --multi 0x18EEFF10 0x18EEFF11 ) > "$multi_out" 2>/dev/null & MPBPID=$!; PIDS+=("$MPBPID")
+sleep 2.0
+cansend "$VCAN" "18FF0113#CD" 2>/dev/null
+echo "  injected: 18FF0113 (to first channel)"
+wait "$MPBPID" 2>/dev/null
+sleep 0.4
+kill "$MCNPID" "$MCDPID" 2>/dev/null
+sleep 0.8
+if grep -qE "MULTI .*distinct=1" "$multi_out"; then
+  echo "  PASS: two channels opened with distinct handles"
+else
+  echo "  FAIL: distinct handles not reported"; sed 's/^/    /' "$multi_out"; FAIL=1
+fi
+if grep -qiE "18EEFF10" "$multi_cap" && grep -qiE "18EEFF11" "$multi_cap"; then
+  echo "  PASS: TX from both channels seen on $VCAN"
+else
+  echo "  FAIL: both channels' TX not seen on $VCAN"
+  echo "  --- candump ---"; sed 's/^/    /' "$multi_cap"
+  echo "  --- probe ---"; sed 's/^/    /' "$multi_out"; FAIL=1
+fi
+if grep -qE "RXa id=0x18FF0113" "$multi_out"; then
+  echo "  PASS: first channel still receives injected frame"
+else
+  echo "  FAIL: first channel did not receive injected frame"; sed 's/^/    /' "$multi_out"; FAIL=1
+fi
+rm -f "$multi_cap" "$multi_out"
+
 echo
 if [ "$FAIL" = 0 ]; then echo "SELFTEST: PASS"; else echo "SELFTEST: FAIL"; fi
 exit "$FAIL"
