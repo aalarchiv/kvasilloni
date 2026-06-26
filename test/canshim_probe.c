@@ -43,6 +43,7 @@
 #define canFDMSG_BRS 0x020000
 #define canFDMSG_ESI 0x040000
 #define canERR_NOMSG (-2)
+#define canOPEN_CAN_FD 0x0400  /* open flag: app provides a 64-byte FD rx buffer */
 
 #define canFILTER_SET_CODE_STD 3
 #define canFILTER_SET_MASK_STD 4
@@ -129,7 +130,10 @@ int main(int argc, char **argv)
 #undef GET
 
     p_init();
-    h = p_open(0, 0);
+    /* A CAN FD app MUST open with canOPEN_CAN_FD and provide a 64-byte receive
+     * buffer; a classic app opens with 0 and an 8-byte buffer. Match that so the
+     * shim delivers FD payloads in full without overrunning a classic buffer. */
+    h = p_open(0, is_fd ? canOPEN_CAN_FD : 0);
     if (h < 0) { fprintf(stderr, "PROBE: canOpenChannel failed %d\n", h); return 3; }
     p_setbus(h, 250000, 0, 0, 0, 0, 0);
     p_buson(h);
@@ -139,15 +143,16 @@ int main(int argc, char **argv)
     printf("PROBE: TX id=0x%lX dlc=%u flag=0x%x -> st=%d\n", id, dlc, flag, st);
     fflush(stdout);
 
-    /* poll for ~5s for inbound frames */
+    /* poll for ~5s for inbound frames. Buffer sized for FD (64) when opened FD,
+     * matching the open mode; a classic open never returns more than 8 bytes. */
     for (loops = 0; loops < 500; loops++) {
         long rid; unsigned rdlc, rflag; unsigned long t;
-        unsigned char rbuf[8];
+        unsigned char rbuf[64];
         int r = p_read(h, &rid, rbuf, &rdlc, &rflag, &t);
         if (r == 0) {
             unsigned j;
             printf("PROBE: RX id=0x%lX dlc=%u flag=0x%x data=", rid, rdlc, rflag);
-            for (j = 0; j < rdlc && j < 8; j++) printf("%02X", rbuf[j]);
+            for (j = 0; j < rdlc && j < 64; j++) printf("%02X", rbuf[j]);
             printf("\n"); fflush(stdout);
         } else {
             Sleep(10);

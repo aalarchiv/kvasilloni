@@ -54,6 +54,12 @@ const CAN_ERR_NOT_IMPLEMENTED: c_int = -32;
 /// `canDRIVER_NORMAL` (canlib.h): default output-control driver type.
 const CAN_DRIVER_NORMAL: u32 = 4;
 
+/// `canOPEN_CAN_FD` (canlib.h) open flag: the app opened the channel for CAN FD
+/// and so provides a receive buffer large enough for FD payloads (up to 64
+/// bytes). Without it the channel is classic and `canRead` never returns more
+/// than 8 bytes, protecting an 8-byte caller buffer (kvasilloni-nmt).
+const CAN_OPEN_CAN_FD: c_int = 0x0400;
+
 // ---- canReadStatus flag bits (canstat.h) ----
 /// `canSTAT_RX_PENDING`: at least one frame is queued for reading.
 const CAN_STAT_RX_PENDING: c_ulong = 0x0000_0020;
@@ -179,6 +185,10 @@ pub extern "system" fn canOpenChannel(channel: c_int, flags: c_int) -> c_int {
                         cfg.local_port
                     ));
                 }
+                // Record whether the app opted into CAN FD; gates RX delivery
+                // width so an FD frame can't overflow a classic 8-byte canRead
+                // buffer (kvasilloni-nmt).
+                c.set_fd_capable(flags & CAN_OPEN_CAN_FD != 0);
                 let hnd = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
                 CONNS.lock().unwrap_or_else(|e| e.into_inner()).insert(hnd, Arc::new(c));
                 log(&format!("canOpenChannel -> handle {hnd}"));
@@ -297,18 +307,26 @@ pub extern "system" fn canRead(
             Some(c) => c.clone(),
             None => return CAN_ERR_INVHANDLE,
         };
+        let fd_capable = conn.fd_capable();
         let frame = conn.read();
         let f = match frame {
             Some(f) => f,
             None => return CAN_ERR_NOMSG,
         };
-        unsafe { write_read_outputs(&f, id, msg, dlc, flag, time) };
+        unsafe { write_read_outputs(&f, id, msg, dlc, flag, time, fd_capable) };
         CAN_OK
     })
 }
 
 /// Marshal a received [`Frame`] into the C out-parameters shared by `canRead`
-/// and `canReadWait`. Every pointer is null-checked; `msg` is bounded by `len`.
+/// and `canReadWait`. Every pointer is null-checked.
+///
+/// `fd_capable` is whether the channel was opened with `canOPEN_CAN_FD`. It bounds
+/// how many bytes may be written into the caller's `msg` buffer: the Kvaser
+/// `canRead` ABI carries no buffer length, so a classic (non-FD) caller sizes
+/// `msg` at 8 bytes. A classic channel therefore delivers at most 8 bytes and is
+/// reported as a classic frame, so even a 64-byte FD frame on the wire cannot
+/// overflow that buffer (kvasilloni-nmt). An FD channel delivers up to 64.
 unsafe fn write_read_outputs(
     f: &Frame,
     id: *mut c_long,
@@ -316,11 +334,20 @@ unsafe fn write_read_outputs(
     dlc: *mut c_uint,
     flag: *mut c_uint,
     time: *mut c_ulong,
+    fd_capable: bool,
 ) {
-    let (oid, mut oflag) = wire::canid_to_kvaser(f.can_id, f.fd);
-    if f.fd {
+    // Only present FD framing (FDF/BRS/ESI, wide payload) when the app opened the
+    // channel for it; otherwise the frame is delivered with classic semantics.
+    let report_fd = f.fd && fd_capable;
+    let (oid, mut oflag) = wire::canid_to_kvaser(f.can_id, report_fd);
+    if report_fd {
         oflag |= wire::fd_flags_to_kvaser(f.fd_flags); // BRS/ESI
     }
+    // Cap the delivered length to what the caller's buffer can hold for its
+    // channel class. Classic decoders already reject non-FD frames over 8 bytes;
+    // this also truncates a real FD frame that lands on a classic channel.
+    let max_len = if fd_capable { wire::MAX_FRAME_LEN } else { wire::CLASSIC_FRAME_MAX_LEN };
+    let n = (f.len as usize).min(max_len);
     if !id.is_null() {
         *id = oid as c_long;
     }
@@ -328,14 +355,14 @@ unsafe fn write_read_outputs(
         *flag = oflag as c_uint;
     }
     if !dlc.is_null() {
-        *dlc = f.len as c_uint;
+        *dlc = n as c_uint;
     }
     if !time.is_null() {
         *time = f.rx_time_ms as c_ulong; // receive timestamp in ms (kvasilloni-kha)
     }
-    if !msg.is_null() && f.len > 0 && !f.is_rtr() {
-        let dst = std::slice::from_raw_parts_mut(msg as *mut u8, f.len as usize);
-        dst.copy_from_slice(&f.data[..f.len as usize]);
+    if !msg.is_null() && n > 0 && !f.is_rtr() {
+        let dst = std::slice::from_raw_parts_mut(msg as *mut u8, n);
+        dst.copy_from_slice(&f.data[..n]);
     }
 }
 
@@ -551,14 +578,16 @@ pub extern "system" fn canReadWait(
     timeout: c_ulong,
 ) -> c_int {
     guard(|| {
-        // Take a clone of the RX state and release CONNS before blocking.
-        let shared = match CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd) {
-            Some(c) => c.rx_shared(),
+        // Take a clone of the channel and release CONNS before blocking. Capture
+        // the FD-capability up front so a classic caller's buffer stays bounded.
+        let conn = match CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd) {
+            Some(c) => c.clone(),
             None => return CAN_ERR_INVHANDLE,
         };
-        match shared.pop_wait(timeout_to_duration(timeout)) {
+        let fd_capable = conn.fd_capable();
+        match conn.rx_shared().pop_wait(timeout_to_duration(timeout)) {
             Some(f) => {
-                unsafe { write_read_outputs(&f, id, msg, dlc, flag, time) };
+                unsafe { write_read_outputs(&f, id, msg, dlc, flag, time, fd_capable) };
                 CAN_OK
             }
             None => CAN_ERR_NOMSG,
@@ -658,7 +687,9 @@ pub extern "system" fn canGetNumberOfChannels(channel_count: *mut c_int) -> c_in
     guard(|| {
         // Channel count is static config; read the INI once and memoize so apps
         // that poll this don't re-hit the disk every call (kvasilloni-7yl).
-        let n = channels_memo(&ENUM_CHANNELS, || Config::load().channels) as c_int;
+        // Clamp to i32::MAX so an absurd config value can't wrap to a negative
+        // count Kvaser would never return (apps use it as a loop/array bound).
+        let n = channels_memo(&ENUM_CHANNELS, || Config::load().channels).min(i32::MAX as u32) as c_int;
         unsafe {
             if !channel_count.is_null() {
                 *channel_count = n;
@@ -949,6 +980,76 @@ mod tests {
             CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "handle table leaked channels after the stress run"
         );
+    }
+
+    // ---- kvasilloni-nmt: RX delivery must not overflow the caller's buffer ----
+
+    #[test]
+    fn classic_channel_caps_rx_to_eight_bytes() {
+        // An FD frame (64 bytes on the wire) delivered to a channel opened WITHOUT
+        // canOPEN_CAN_FD must hand back at most 8 bytes and report classic
+        // semantics, so a classic app's 8-byte msg buffer is never overrun.
+        let mut f = Frame::default();
+        f.can_id = 0x321;
+        f.fd = true;
+        f.fd_flags = wire::CANFD_BRS;
+        f.len = 64;
+        for i in 0..64 {
+            f.data[i] = i as u8;
+        }
+        // Over-size the destination so we can prove only 8 bytes were touched.
+        let mut buf = [0xEEu8; 64];
+        let mut id: c_long = 0;
+        let (mut dlc, mut flag): (c_uint, c_uint) = (0, 0);
+        let mut time: c_ulong = 0;
+        unsafe {
+            write_read_outputs(
+                &f,
+                &mut id,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut dlc,
+                &mut flag,
+                &mut time,
+                false, // classic channel
+            );
+        }
+        assert_eq!(dlc, 8, "classic channel must report at most 8 bytes");
+        assert_eq!(flag & wire::CAN_MSG_FDF, 0, "FD flag must not be set on a classic channel");
+        assert_eq!(&buf[..8], &f.data[..8], "first 8 bytes delivered");
+        assert!(buf[8..].iter().all(|&b| b == 0xEE), "bytes past 8 must be untouched (no overflow)");
+    }
+
+    #[test]
+    fn fd_channel_delivers_full_payload() {
+        // The same frame on an FD-opened channel delivers all 64 bytes with the
+        // FD/BRS flags intact.
+        let mut f = Frame::default();
+        f.can_id = 0x321;
+        f.fd = true;
+        f.fd_flags = wire::CANFD_BRS;
+        f.len = 64;
+        for i in 0..64 {
+            f.data[i] = i as u8;
+        }
+        let mut buf = [0u8; 64];
+        let mut id: c_long = 0;
+        let (mut dlc, mut flag): (c_uint, c_uint) = (0, 0);
+        let mut time: c_ulong = 0;
+        unsafe {
+            write_read_outputs(
+                &f,
+                &mut id,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut dlc,
+                &mut flag,
+                &mut time,
+                true, // FD channel
+            );
+        }
+        assert_eq!(dlc, 64);
+        assert_ne!(flag & wire::CAN_MSG_FDF, 0, "FD flag must be reported");
+        assert_ne!(flag & wire::CAN_MSG_BRS, 0, "BRS must be reported");
+        assert_eq!(&buf[..], &f.data[..]);
     }
 
     #[test]

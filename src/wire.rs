@@ -21,6 +21,15 @@ pub const CONNECT_V1: &[u8] = b"CANNELLONIv1"; // TCP handshake banner
 /// `Frame.data`. See kvasilloni-kkt.
 pub const MAX_FRAME_LEN: usize = 64;
 
+/// Maximum data bytes a *classic* (non-FD) CAN frame can carry. A frame without
+/// the FD bit set MUST NOT exceed this: a real classic frame physically tops out
+/// at 8 bytes, and `canRead` callers that did not open the channel for CAN FD
+/// size their receive buffer accordingly (the Kvaser `canRead` ABI carries no
+/// buffer-length argument). Both decoders reject a non-FD frame claiming more, so
+/// an over-length "classic" frame can never reach a caller's 8-byte buffer.
+/// See kvasilloni-nmt.
+pub const CLASSIC_FRAME_MAX_LEN: usize = 8;
+
 // ---- SocketCAN can_id flag bits (linux/can.h) ----
 pub const CAN_EFF_FLAG: u32 = 0x8000_0000;
 pub const CAN_RTR_FLAG: u32 = 0x4000_0000;
@@ -218,8 +227,11 @@ pub fn decode_stream(data: &[u8], f: &mut Frame, state: &mut DecodeState) -> Dec
                 *state = DecodeState::Init;
                 return Decoded::Complete;
             }
-            if f.len as usize > MAX_FRAME_LEN {
-                return Decoded::Error; // would overrun Frame.data (kvasilloni-kkt)
+            if f.len as usize > CLASSIC_FRAME_MAX_LEN {
+                // A non-FD frame over 8 bytes is malformed; rejecting it keeps an
+                // over-length "classic" frame from ever reaching a caller's
+                // 8-byte canRead buffer (kvasilloni-nmt).
+                return Decoded::Error;
             }
             *state = DecodeState::Data;
             Decoded::Need(f.len as usize)
@@ -301,8 +313,12 @@ pub fn parse_udp(buf: &[u8]) -> Option<Vec<Frame>> {
             f.len = raw;
         }
         let dlen = (f.len & 0x7F) as usize;
-        if dlen > MAX_FRAME_LEN {
-            return None; // would overrun Frame.data (kvasilloni-kkt)
+        // FD reaches 64 bytes; a non-FD frame must not exceed 8 (a real classic
+        // frame's max, and the size a non-FD canRead caller's buffer assumes).
+        // Reject anything larger rather than over-read or deliver it (kvasilloni-nmt/-kkt).
+        let limit = if f.fd { MAX_FRAME_LEN } else { CLASSIC_FRAME_MAX_LEN };
+        if dlen > limit {
+            return None;
         }
         if !f.is_rtr() {
             if p + dlen > buf.len() {
@@ -503,6 +519,61 @@ mod tests {
         let _ = decode_stream(&[], &mut f2, &mut st2);
         let _ = decode_stream(&[0, 0, 1, 0x23], &mut f2, &mut st2);
         assert!(matches!(decode_stream(&[CANFD_FRAME | 70], &mut f2, &mut st2), Decoded::Error));
+    }
+
+    #[test]
+    fn parse_udp_rejects_overlong_classic_keeps_valid_fd() {
+        // kvasilloni-nmt: a non-FD frame can carry at most 8 bytes. One claiming
+        // 9..64 (FD bit clear) must be rejected so it can never be delivered into
+        // a classic caller's 8-byte canRead buffer.
+        let mut pkt = vec![0x02, 0x00, 0x00, 0x00, 0x01]; // ver, DATA, seq, count=1
+        pkt.extend_from_slice(&[0x00, 0x00, 0x01, 0x23]); // can_id 0x123
+        pkt.push(9); // len = 9, no FD bit -> illegal for classic
+        pkt.extend(std::iter::repeat(0xAB).take(9));
+        assert!(parse_udp(&pkt).is_none(), "over-length classic frame must be rejected");
+
+        // Exactly 8 (classic max) still parses.
+        let ok8 = build_udp(&mk(0x123, &[1, 2, 3, 4, 5, 6, 7, 8]), 0);
+        assert_eq!(parse_udp(&ok8).unwrap()[0].len, 8);
+
+        // A real FD frame with 16 bytes (FD bit set) is still accepted - the limit
+        // is per frame class, not a blanket 8.
+        let mut fd = Frame::default();
+        fd.can_id = 0x200;
+        fd.fd = true;
+        fd.len = 16;
+        for i in 0..16 {
+            fd.data[i] = i as u8;
+        }
+        let pktfd = build_udp(&fd, 0);
+        let got = parse_udp(&pktfd).expect("valid FD frame must parse");
+        assert!(got[0].fd && got[0].len == 16);
+    }
+
+    #[test]
+    fn decode_stream_rejects_overlong_classic() {
+        // kvasilloni-nmt: the TCP decoder must reject a non-FD frame over 8 bytes
+        // at the Len state, before requesting a Data read that could be delivered
+        // to a classic 8-byte buffer.
+        let mut f = Frame::default();
+        let mut st = DecodeState::Init;
+        let _ = decode_stream(&[], &mut f, &mut st); // -> Need(4)
+        let _ = decode_stream(&[0, 0, 1, 0x23], &mut f, &mut st); // -> Need(1)
+        assert!(matches!(decode_stream(&[9], &mut f, &mut st), Decoded::Error));
+
+        // len == 8 (classic max) is fine and asks for 8 data bytes.
+        let mut f2 = Frame::default();
+        let mut st2 = DecodeState::Init;
+        let _ = decode_stream(&[], &mut f2, &mut st2);
+        let _ = decode_stream(&[0, 0, 1, 0x23], &mut f2, &mut st2);
+        assert!(matches!(decode_stream(&[8], &mut f2, &mut st2), Decoded::Need(8)));
+
+        // An FD frame of 16 bytes is still accepted (FD bit set).
+        let mut f3 = Frame::default();
+        let mut st3 = DecodeState::Init;
+        let _ = decode_stream(&[], &mut f3, &mut st3);
+        let _ = decode_stream(&[0, 0, 1, 0x23], &mut f3, &mut st3);
+        assert!(matches!(decode_stream(&[CANFD_FRAME | 16], &mut f3, &mut st3), Decoded::Need(1)));
     }
 
     #[test]

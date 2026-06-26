@@ -261,6 +261,12 @@ pub struct Conn {
     /// Actual bound local port. For UDP this may differ from the configured
     /// `local_port` if that was busy and we fell back to ephemeral (kvasilloni-iai).
     local_port: u16,
+    /// Whether the channel was opened for CAN FD (canOPEN_CAN_FD). Gates how wide
+    /// RX delivery may be: a classic channel never returns more than 8 data bytes,
+    /// so a (legitimately up-to-64-byte) FD frame cannot overflow a classic app's
+    /// 8-byte `canRead` buffer. Set by `canOpenChannel` from the open flags; the
+    /// Kvaser `canRead` ABI has no buffer-length argument (kvasilloni-nmt).
+    fd_capable: AtomicBool,
 }
 
 /// The unspecified ("any") address of the same family as `peer` - `0.0.0.0` for
@@ -353,6 +359,7 @@ impl Conn {
                 rx_sock: RxStop::Udp(sock), // original handle, used to stop the loop
                 handle: Mutex::new(Some(handle)),
                 local_port,
+                fd_capable: AtomicBool::new(false),
             });
         }
 
@@ -399,7 +406,20 @@ impl Conn {
             rx_sock: RxStop::Tcp(stop_stream),
             handle: Mutex::new(Some(handle)),
             local_port,
+            fd_capable: AtomicBool::new(false),
         })
+    }
+
+    /// Record whether this channel was opened for CAN FD (canOPEN_CAN_FD). When
+    /// false, RX delivery is capped at 8 data bytes so an FD frame cannot overflow
+    /// a classic caller's `canRead` buffer (kvasilloni-nmt).
+    pub fn set_fd_capable(&self, yes: bool) {
+        self.fd_capable.store(yes, Ordering::SeqCst);
+    }
+
+    /// Whether the channel was opened for CAN FD (see `set_fd_capable`).
+    pub fn fd_capable(&self) -> bool {
+        self.fd_capable.load(Ordering::SeqCst)
     }
 
     /// Actual bound local port (UDP may differ from the configured one after an
