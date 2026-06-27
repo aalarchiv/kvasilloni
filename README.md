@@ -81,7 +81,10 @@ canGetBusStatistics  canGetErrorText  canGetVersion    canClose
 
 Classic CAN frames (11-bit and 29-bit IDs, DLC 0-8, RTR) and **CAN FD**
 (`canFDMSG_FDF`/`BRS`/`ESI`, payloads up to 64 bytes, DLC auto-rounded to a valid
-FD length) are supported in both directions.
+FD length) are supported in both directions. To **receive** FD payloads larger
+than 8 bytes, open the channel with the `canOPEN_CAN_FD` flag (`canOpenChannel(ch,
+canOPEN_CAN_FD)`); a channel opened classic caps `canRead` at 8 bytes so an FD
+frame on the bus can never overrun a classic 8-byte receive buffer.
 
 ### Extended exports (for retargeting to other apps)
 
@@ -106,6 +109,27 @@ targeting a new app):
 shim's RX thread**, not the thread that called `canSetNotify`. Keep it short and
 non-blocking, and ensure the function pointer stays valid until you disarm it
 (`canSetNotify(h, NULL, ...)`) or `canClose`. Only `canNOTIFY_RX` is delivered.
+
+## Upgrading from 0.2.0
+
+0.3.0 adds the networking-hardening set plus two memory-safety fixes. Existing
+`kvasilloni.ini` files keep working unchanged (every new key has a safe default),
+but three behavior changes are worth knowing:
+
+1. **`peercheck` defaults on.** Inbound UDP datagrams and TCP-server connections
+   from any source other than `host` are now dropped (cannelloni's `-R` default).
+   If your cannelloni's source IP differs from `host`, set `host` correctly, list
+   it in `allow`, or set `peercheck = off` (= cannelloni `-p`).
+2. **CAN FD receive requires `canOPEN_CAN_FD`.** A channel opened classic now caps
+   `canRead`/`canReadWait` at 8 bytes (and reports classic flags), so a 64-byte FD
+   frame can't overrun an 8-byte buffer. FD apps must `canOpenChannel(ch,
+   canOPEN_CAN_FD)` and provide a 64-byte receive buffer.
+3. **A busy UDP `localport` fails the open** instead of silently binding an
+   ephemeral (TX-only) port. Set `udpportfallback = on` to restore the old
+   behavior if you knowingly want a TX-only channel.
+
+To carry an existing config forward into the fully-commented 0.3.0 template, use
+`tools/ini_merge.py your-kvasilloni.ini -o kvasilloni.ini`.
 
 ## Build
 
