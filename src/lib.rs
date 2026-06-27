@@ -154,11 +154,17 @@ fn guard<F: FnOnce() -> c_int>(f: F) -> c_int {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(CAN_ERR_PARAM)
 }
 
+/// `guard` for exports that return nothing: a panic is contained rather than
+/// allowed to unwind across the FFI boundary (which would abort the process).
+fn guard_void<F: FnOnce()>(f: F) {
+    let _ = catch_unwind(AssertUnwindSafe(f));
+}
+
 // ============================== exported API ==============================
 
 #[no_mangle]
 pub extern "system" fn canInitializeLibrary() {
-    log("canInitializeLibrary");
+    guard_void(|| log("canInitializeLibrary"));
 }
 
 #[no_mangle]
@@ -167,6 +173,9 @@ pub extern "system" fn canOpenChannel(channel: c_int, flags: c_int) -> c_int {
         let cfg = Config::load();
         if let Ok(mut g) = LOG_PATH.lock() {
             *g = cfg.log.clone();
+        }
+        for w in &cfg.warnings {
+            log(&format!("canOpenChannel: config warning: {w} (kvasilloni-4sd)"));
         }
         log(&format!(
             "canOpenChannel(ch={channel}, flags={flags:#x}) proto={} host={}:{} local={} role={}",
@@ -222,20 +231,26 @@ pub extern "system" fn canSetBusParams(
     _no_samp: c_uint,
     _sync_mode: c_uint,
 ) -> c_int {
-    log(&format!("canSetBusParams(freq={freq})"));
-    CAN_OK
+    guard(|| {
+        log(&format!("canSetBusParams(freq={freq})"));
+        CAN_OK
+    })
 }
 
 #[no_mangle]
 pub extern "system" fn canBusOn(_hnd: c_int) -> c_int {
-    log("canBusOn");
-    CAN_OK
+    guard(|| {
+        log("canBusOn");
+        CAN_OK
+    })
 }
 
 #[no_mangle]
 pub extern "system" fn canBusOff(_hnd: c_int) -> c_int {
-    log("canBusOff");
-    CAN_OK
+    guard(|| {
+        log("canBusOff");
+        CAN_OK
+    })
 }
 
 #[no_mangle]
@@ -376,6 +391,18 @@ fn timeout_to_duration(timeout: c_ulong) -> Duration {
     }
 }
 
+/// Block duration for `canReadWait`/`canReadSync`. Same as `timeout_to_duration`,
+/// except a read issued from *inside* a notify callback (which runs on the RX
+/// thread) collapses to a non-blocking poll: blocking there would park the only
+/// producer and the wait could never be satisfied (kvasilloni-2qh).
+fn read_wait_duration(timeout: c_ulong) -> Duration {
+    if transport::in_notify_callback() {
+        Duration::ZERO
+    } else {
+        timeout_to_duration(timeout)
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn canReadStatus(hnd: c_int, flags: *mut c_ulong) -> c_int {
     guard(|| {
@@ -408,18 +435,20 @@ pub extern "system" fn canReadErrorCounters(
     rx_err: *mut c_uint,
     ov_err: *mut c_uint,
 ) -> c_int {
-    unsafe {
-        if !tx_err.is_null() {
-            *tx_err = 0;
+    guard(|| {
+        unsafe {
+            if !tx_err.is_null() {
+                *tx_err = 0;
+            }
+            if !rx_err.is_null() {
+                *rx_err = 0;
+            }
+            if !ov_err.is_null() {
+                *ov_err = 0;
+            }
         }
-        if !rx_err.is_null() {
-            *rx_err = 0;
-        }
-        if !ov_err.is_null() {
-            *ov_err = 0;
-        }
-    }
-    CAN_OK
+        CAN_OK
+    })
 }
 
 #[no_mangle]
@@ -428,12 +457,14 @@ pub extern "system" fn canGetBusStatistics(
     stat: *mut c_void,
     bufsiz: usize,
 ) -> c_int {
-    unsafe {
-        if !stat.is_null() && bufsiz > 0 {
-            std::ptr::write_bytes(stat as *mut u8, 0, bufsiz);
+    guard(|| {
+        unsafe {
+            if !stat.is_null() && bufsiz > 0 {
+                std::ptr::write_bytes(stat as *mut u8, 0, bufsiz);
+            }
         }
-    }
-    CAN_OK
+        CAN_OK
+    })
 }
 
 #[no_mangle]
@@ -443,21 +474,23 @@ pub extern "system" fn canGetVersion() -> c_ushort {
 
 #[no_mangle]
 pub extern "system" fn canGetErrorText(err: c_int, buf: *mut c_char, bufsiz: c_uint) -> c_int {
-    let text: &[u8] = match err {
-        CAN_OK => b"OK\0",
-        CAN_ERR_PARAM => b"Error in parameter\0",
-        CAN_ERR_NOMSG => b"No messages available\0",
-        CAN_ERR_NOTFOUND => b"Specified device not found\0",
-        _ => b"Unknown error\0",
-    };
-    unsafe {
-        if !buf.is_null() && bufsiz > 0 {
-            let n = (bufsiz as usize - 1).min(text.len() - 1);
-            std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
-            *buf.add(n) = 0;
+    guard(|| {
+        let text: &[u8] = match err {
+            CAN_OK => b"OK\0",
+            CAN_ERR_PARAM => b"Error in parameter\0",
+            CAN_ERR_NOMSG => b"No messages available\0",
+            CAN_ERR_NOTFOUND => b"Specified device not found\0",
+            _ => b"Unknown error\0",
+        };
+        unsafe {
+            if !buf.is_null() && bufsiz > 0 {
+                let n = (bufsiz as usize - 1).min(text.len() - 1);
+                std::ptr::copy_nonoverlapping(text.as_ptr(), buf as *mut u8, n);
+                *buf.add(n) = 0;
+            }
         }
-    }
-    CAN_OK
+        CAN_OK
+    })
 }
 
 #[no_mangle]
@@ -540,17 +573,21 @@ pub extern "system" fn canFlushReceiveQueue(hnd: c_int) -> c_int {
 
 #[no_mangle]
 pub extern "system" fn canFlushTransmitQueue(_hnd: c_int) -> c_int {
-    log("canFlushTransmitQueue");
-    CAN_OK // TX is synchronous: nothing is ever queued
+    guard(|| {
+        log("canFlushTransmitQueue");
+        CAN_OK // TX is synchronous: nothing is ever queued
+    })
 }
 
 // ---- kvasilloni-zva: bus output control (driver type) ----
 
 #[no_mangle]
 pub extern "system" fn canSetBusOutputControl(_hnd: c_int, drivertype: c_uint) -> c_int {
-    log(&format!("canSetBusOutputControl(drivertype={drivertype})"));
-    DRIVER_TYPE.store(drivertype as u32, Ordering::SeqCst);
-    CAN_OK
+    guard(|| {
+        log(&format!("canSetBusOutputControl(drivertype={drivertype})"));
+        DRIVER_TYPE.store(drivertype as u32, Ordering::SeqCst);
+        CAN_OK
+    })
 }
 
 #[no_mangle]
@@ -585,7 +622,7 @@ pub extern "system" fn canReadWait(
             None => return CAN_ERR_INVHANDLE,
         };
         let fd_capable = conn.fd_capable();
-        match conn.rx_shared().pop_wait(timeout_to_duration(timeout)) {
+        match conn.rx_shared().pop_wait(read_wait_duration(timeout)) {
             Some(f) => {
                 unsafe { write_read_outputs(&f, id, msg, dlc, flag, time, fd_capable) };
                 CAN_OK
@@ -602,7 +639,7 @@ pub extern "system" fn canReadSync(hnd: c_int, timeout: c_ulong) -> c_int {
             Some(c) => c.rx_shared(),
             None => return CAN_ERR_INVHANDLE,
         };
-        if shared.peek_wait(timeout_to_duration(timeout)) {
+        if shared.peek_wait(read_wait_duration(timeout)) {
             CAN_OK
         } else {
             CAN_ERR_NOMSG
@@ -625,7 +662,7 @@ pub extern "system" fn canWriteWait(
 
 #[no_mangle]
 pub extern "system" fn canWriteSync(_hnd: c_int, _timeout: c_ulong) -> c_int {
-    CAN_OK // no TX queue to drain
+    guard(|| CAN_OK) // no TX queue to drain
 }
 
 // ---- kvasilloni-efg: canIoCtl dispatch ----
@@ -675,9 +712,11 @@ pub extern "system" fn canObjBufSetFilter(
     _code: c_uint,
     _mask: c_uint,
 ) -> c_int {
-    // Object buffers are a separate (auto-response) mechanism; benign no-op.
-    log("canObjBufSetFilter (no-op)");
-    CAN_OK
+    guard(|| {
+        // Object buffers are a separate (auto-response) mechanism; benign no-op.
+        log("canObjBufSetFilter (no-op)");
+        CAN_OK
+    })
 }
 
 // ---- kvasilloni-7hn: channel enumeration ----

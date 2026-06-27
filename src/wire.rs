@@ -218,20 +218,22 @@ pub fn decode_stream(data: &[u8], f: &mut Frame, state: &mut DecodeState) -> Dec
             }
             f.fd = false;
             f.len = raw;
+            // A non-FD frame (RTR included) is at most 8 bytes; rejecting an
+            // over-length one keeps a bogus "classic" frame from ever reaching a
+            // caller's 8-byte canRead buffer (kvasilloni-nmt).
+            if f.len as usize > CLASSIC_FRAME_MAX_LEN {
+                return Decoded::Error;
+            }
             if f.is_rtr() {
+                // RTR carries a DLC but no data bytes. Keep the DLC so it matches
+                // what parse_udp reports over UDP - both transports now agree
+                // instead of TCP zeroing it (kvasilloni-f1b).
                 *state = DecodeState::Init;
-                f.len = 0;
                 return Decoded::Complete;
             }
             if f.len == 0 {
                 *state = DecodeState::Init;
                 return Decoded::Complete;
-            }
-            if f.len as usize > CLASSIC_FRAME_MAX_LEN {
-                // A non-FD frame over 8 bytes is malformed; rejecting it keeps an
-                // over-length "classic" frame from ever reaching a caller's
-                // 8-byte canRead buffer (kvasilloni-nmt).
-                return Decoded::Error;
             }
             *state = DecodeState::Data;
             Decoded::Need(f.len as usize)
@@ -548,6 +550,21 @@ mod tests {
         let pktfd = build_udp(&fd, 0);
         let got = parse_udp(&pktfd).expect("valid FD frame must parse");
         assert!(got[0].fd && got[0].len == 16);
+    }
+
+    #[test]
+    fn classic_rtr_dlc_consistent_across_transports() {
+        // kvasilloni-f1b: a classic RTR frame carries a DLC but no data. Both the
+        // UDP parser and the TCP stream decoder must report the same DLC (TCP used
+        // to zero it).
+        let mut f = Frame::default();
+        f.can_id = 0x123 | CAN_RTR_FLAG;
+        f.len = 8;
+        let udp = parse_udp(&build_udp(&f, 0)).expect("parse")[0];
+        let tcp = stream_roundtrip(&f);
+        assert!(udp.is_rtr() && tcp.is_rtr(), "RTR flag lost");
+        assert_eq!(udp.len, 8, "UDP dropped the RTR DLC");
+        assert_eq!(tcp.len, 8, "TCP dropped the RTR DLC");
     }
 
     #[test]

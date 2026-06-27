@@ -107,8 +107,11 @@ targeting a new app):
 
 **`canSetNotify` threading caveat:** the registered callback is invoked **on the
 shim's RX thread**, not the thread that called `canSetNotify`. Keep it short and
-non-blocking, and ensure the function pointer stays valid until you disarm it
-(`canSetNotify(h, NULL, ...)`) or `canClose`. Only `canNOTIFY_RX` is delivered.
+non-blocking. Disarming (`canSetNotify(h, NULL, ...)`) or `canClose` is race-free:
+once it returns the old callback is no longer running, so you may then free its
+context. A `canReadWait`/`canReadSync` issued *from inside* the callback collapses
+to a non-blocking poll (blocking there would stall the RX thread). Only
+`canNOTIFY_RX` is delivered.
 
 ## Upgrading from 0.2.0
 

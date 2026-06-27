@@ -106,6 +106,14 @@ thread_local! {
     static IN_NOTIFY_CB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether the current thread is executing inside a notify callback - i.e. on the
+/// RX (producer) thread, mid-callback. A blocking read issued from there would
+/// park the only producer, so `canReadWait`/`canReadSync` fall back to a
+/// non-blocking poll instead of stalling (kvasilloni-2qh).
+pub fn in_notify_callback() -> bool {
+    IN_NOTIFY_CB.with(|f| f.get())
+}
+
 /// RAII marker for "this thread is currently executing a notify callback".
 /// Resets the flag even if the callback unwinds.
 struct CbScope;

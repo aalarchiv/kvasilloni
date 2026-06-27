@@ -64,6 +64,11 @@ pub struct Config {
     /// Explicit allow-list of peer IPs. Empty => just the configured `host`.
     /// Only consulted when `peer_check` is on.
     pub allow: Vec<IpAddr>,
+    /// Non-fatal configuration problems collected while loading (an empty `host`,
+    /// or a present-but-unparseable numeric like `port=70000`). `canOpenChannel`
+    /// logs these so a misconfiguration is visible instead of silently falling
+    /// back to a default. Not a config key itself. See kvasilloni-4sd.
+    pub warnings: Vec<String>,
 }
 
 impl Default for Config {
@@ -81,6 +86,25 @@ impl Default for Config {
             udp_port_fallback: false,
             peer_check: true,
             allow: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// Parse a numeric config value, recording a warning (and keeping the default by
+/// returning `None`) when a *non-empty* value fails to parse - e.g. `port=70000`
+/// or `connecttimeout=abc`. A blank/absent value returns `None` silently.
+/// See kvasilloni-4sd.
+fn parse_num<T: std::str::FromStr>(val: &str, name: &str, warnings: &mut Vec<String>) -> Option<T> {
+    let t = val.trim();
+    if t.is_empty() {
+        return None;
+    }
+    match t.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            warnings.push(format!("invalid {name}={val:?}; using default"));
+            None
         }
     }
 }
@@ -98,13 +122,21 @@ impl Config {
 
     fn apply_map(&mut self, m: &HashMap<String, String>) {
         if let Some(v) = m.get("host") {
-            self.host = v.clone();
+            if v.trim().is_empty() {
+                self.warnings.push("empty 'host'; using default".into());
+            } else {
+                self.host = v.clone();
+            }
         }
-        if let Some(v) = m.get("port").and_then(|v| v.parse().ok()) {
-            self.remote_port = v;
+        if let Some(v) = m.get("port") {
+            if let Some(p) = parse_num::<u16>(v, "port", &mut self.warnings) {
+                self.remote_port = p;
+            }
         }
-        if let Some(v) = m.get("localport").and_then(|v| v.parse().ok()) {
-            self.local_port = v;
+        if let Some(v) = m.get("localport") {
+            if let Some(p) = parse_num::<u16>(v, "localport", &mut self.warnings) {
+                self.local_port = p;
+            }
         }
         if let Some(v) = m.get("proto") {
             self.tcp = starts_with_ci(v, b't');
@@ -117,14 +149,20 @@ impl Config {
                 self.log = Some(v.clone());
             }
         }
-        if let Some(v) = m.get("channels").and_then(|v| v.parse().ok()) {
-            self.channels = v;
+        if let Some(v) = m.get("channels") {
+            if let Some(n) = parse_num::<u32>(v, "channels", &mut self.warnings) {
+                self.channels = n;
+            }
         }
-        if let Some(v) = m.get("connecttimeout").and_then(|v| v.parse().ok()) {
-            self.connect_timeout_ms = v;
+        if let Some(v) = m.get("connecttimeout") {
+            if let Some(n) = parse_num::<u32>(v, "connecttimeout", &mut self.warnings) {
+                self.connect_timeout_ms = n;
+            }
         }
-        if let Some(v) = m.get("accepttimeout").and_then(|v| v.parse().ok()) {
-            self.accept_timeout_ms = v;
+        if let Some(v) = m.get("accepttimeout") {
+            if let Some(n) = parse_num::<u32>(v, "accepttimeout", &mut self.warnings) {
+                self.accept_timeout_ms = n;
+            }
         }
         if let Some(v) = m.get("udpportfallback") {
             self.udp_port_fallback = parse_bool(v);
@@ -140,13 +178,21 @@ impl Config {
     fn apply_env(&mut self) {
         let e = |k: &str| std::env::var(k).ok();
         if let Some(v) = e("KVASILLONI_HOST") {
-            self.host = v;
+            if v.trim().is_empty() {
+                self.warnings.push("empty KVASILLONI_HOST; using default".into());
+            } else {
+                self.host = v;
+            }
         }
-        if let Some(v) = e("KVASILLONI_PORT").and_then(|v| v.parse().ok()) {
-            self.remote_port = v;
+        if let Some(v) = e("KVASILLONI_PORT") {
+            if let Some(p) = parse_num::<u16>(&v, "KVASILLONI_PORT", &mut self.warnings) {
+                self.remote_port = p;
+            }
         }
-        if let Some(v) = e("KVASILLONI_LOCALPORT").and_then(|v| v.parse().ok()) {
-            self.local_port = v;
+        if let Some(v) = e("KVASILLONI_LOCALPORT") {
+            if let Some(p) = parse_num::<u16>(&v, "KVASILLONI_LOCALPORT", &mut self.warnings) {
+                self.local_port = p;
+            }
         }
         if let Some(v) = e("KVASILLONI_PROTO") {
             self.tcp = starts_with_ci(&v, b't');
@@ -159,14 +205,20 @@ impl Config {
                 self.log = Some(v);
             }
         }
-        if let Some(v) = e("KVASILLONI_CHANNELS").and_then(|v| v.parse().ok()) {
-            self.channels = v;
+        if let Some(v) = e("KVASILLONI_CHANNELS") {
+            if let Some(n) = parse_num::<u32>(&v, "KVASILLONI_CHANNELS", &mut self.warnings) {
+                self.channels = n;
+            }
         }
-        if let Some(v) = e("KVASILLONI_CONNECT_TIMEOUT").and_then(|v| v.parse().ok()) {
-            self.connect_timeout_ms = v;
+        if let Some(v) = e("KVASILLONI_CONNECT_TIMEOUT") {
+            if let Some(n) = parse_num::<u32>(&v, "KVASILLONI_CONNECT_TIMEOUT", &mut self.warnings) {
+                self.connect_timeout_ms = n;
+            }
         }
-        if let Some(v) = e("KVASILLONI_ACCEPT_TIMEOUT").and_then(|v| v.parse().ok()) {
-            self.accept_timeout_ms = v;
+        if let Some(v) = e("KVASILLONI_ACCEPT_TIMEOUT") {
+            if let Some(n) = parse_num::<u32>(&v, "KVASILLONI_ACCEPT_TIMEOUT", &mut self.warnings) {
+                self.accept_timeout_ms = n;
+            }
         }
         if let Some(v) = e("KVASILLONI_UDP_PORT_FALLBACK") {
             self.udp_port_fallback = parse_bool(&v);
@@ -386,6 +438,30 @@ mod tests {
             .map(|s| s.parse().unwrap())
             .collect();
         assert_eq!(cfg.allow, want);
+    }
+
+    #[test]
+    fn invalid_values_warn_and_keep_defaults() {
+        // kvasilloni-4sd: a present-but-bad value must keep the default AND record
+        // a warning, instead of silently falling back.
+        let mut cfg = Config::default();
+        let mut m = HashMap::new();
+        m.insert("host".into(), "   ".into()); // blank host
+        m.insert("port".into(), "70000".into()); // out of u16 range
+        m.insert("connecttimeout".into(), "soon".into()); // not a number
+        cfg.apply_map(&m);
+        assert_eq!(cfg.host, "127.0.0.1", "blank host kept default");
+        assert_eq!(cfg.remote_port, 20000, "out-of-range port kept default");
+        assert_eq!(cfg.connect_timeout_ms, 5000, "bad timeout kept default");
+        assert_eq!(cfg.warnings.len(), 3, "each bad value should warn once");
+
+        // A valid config produces no warnings.
+        let mut ok = Config::default();
+        let mut m2 = HashMap::new();
+        m2.insert("port".into(), "21000".into());
+        m2.insert("host".into(), "10.0.0.1".into());
+        ok.apply_map(&m2);
+        assert!(ok.warnings.is_empty(), "valid config must not warn");
     }
 
     #[test]
