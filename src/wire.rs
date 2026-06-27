@@ -277,6 +277,16 @@ pub fn build_udp(f: &Frame, seq_no: u8) -> Vec<u8> {
     out
 }
 
+/// Upper bound on how many frames to pre-allocate for a datagram of `buf_len`
+/// bytes that claims `count` frames. `count` is attacker-controlled, so it is
+/// clamped to what the datagram could physically hold (each frame is at least
+/// `FRAME_BASE_SIZE` on the wire); trusting it would let a 7-byte spoofed packet
+/// force a ~5MB allocation. The per-frame bounds in `parse_udp` still validate the
+/// real content. Split out so the clamp is unit-testable on its own (kvasilloni-56p).
+fn udp_prealloc_cap(count: u16, buf_len: usize) -> usize {
+    (count as usize).min(buf_len / FRAME_BASE_SIZE + 1)
+}
+
 /// Parse a cannelloni UDP datagram, returning the contained frames.
 /// Returns `None` on a malformed/truncated packet.
 pub fn parse_udp(buf: &[u8]) -> Option<Vec<Frame>> {
@@ -287,12 +297,7 @@ pub fn parse_udp(buf: &[u8]) -> Option<Vec<Frame>> {
         return None;
     }
     let count = u16::from_be_bytes([buf[3], buf[4]]);
-    // Cap the pre-allocation to what this datagram could physically hold (each
-    // frame is >= FRAME_BASE_SIZE on the wire). `count` is attacker-controlled,
-    // so trusting it would let a 7-byte spoofed packet force a ~5MB allocation.
-    // The per-frame bounds below still validate the real content. (kvasilloni-56p)
-    let cap = (count as usize).min(buf.len() / FRAME_BASE_SIZE + 1);
-    let mut frames = Vec::with_capacity(cap);
+    let mut frames = Vec::with_capacity(udp_prealloc_cap(count, buf.len()));
     let mut p = DATA_PACKET_BASE_SIZE;
     for _ in 0..count {
         if p + FRAME_BASE_SIZE > buf.len() {
@@ -346,6 +351,20 @@ mod tests {
         f
     }
 
+    /// Build a multi-frame cannelloni UDP datagram: header {ver, DATA, seq, count}
+    /// followed by `frames` back-to-back via encode_frame. `count` is set
+    /// independently of `frames.len()` so a test can forge an over-claimed
+    /// (truncated) batch. The real `build_udp` only ever emits count=1, so this is
+    /// the only way to drive parse_udp's per-frame loop with N>1 (kvasilloni-im6.3).
+    fn build_udp_batch(frames: &[Frame], seq_no: u8, count: u16) -> Vec<u8> {
+        let mut out = vec![FRAME_VERSION, OP_DATA, seq_no];
+        out.extend_from_slice(&count.to_be_bytes());
+        for f in frames {
+            encode_frame(&mut out, f);
+        }
+        out
+    }
+
     #[test]
     fn golden_udp_std() {
         // STD id=0x123 dlc=2 data=AA BB, seq=7:
@@ -383,6 +402,62 @@ mod tests {
             assert_eq!(got[0].len, c.len);
             assert_eq!(&got[0].data[..c.len as usize], &c.data[..c.len as usize]);
         }
+    }
+
+    #[test]
+    fn parse_udp_decodes_multi_frame_batch() {
+        // kvasilloni-im6.3: stock cannelloni batches several frames into one UDP
+        // datagram under load. parse_udp's per-frame loop must advance the offset
+        // correctly across a MIX of classic / FD / RTR frames - an off-by-one in
+        // the offset arithmetic would mis-decode frame 2 onward.
+        let classic = mk(0x123, &[0x11, 0x22, 0x33]); // STD, 3 data bytes
+        let mut fd = Frame::default();
+        fd.can_id = 0x200;
+        fd.fd = true;
+        fd.fd_flags = CANFD_BRS;
+        fd.len = 16;
+        for i in 0..16 {
+            fd.data[i] = (0xA0 + i) as u8;
+        }
+        let mut rtr = Frame::default();
+        rtr.can_id = 0x321 | CAN_RTR_FLAG;
+        rtr.len = 8; // RTR carries a DLC but no data bytes
+
+        let pkt = build_udp_batch(&[classic, fd, rtr], 9, 3);
+        let got = parse_udp(&pkt).expect("batched datagram must parse");
+        assert_eq!(got.len(), 3, "all three batched frames must decode");
+
+        // frame 0: classic, decoded at the base offset
+        assert_eq!(got[0].can_id, 0x123);
+        assert!(!got[0].fd);
+        assert_eq!(got[0].len, 3);
+        assert_eq!(&got[0].data[..3], &[0x11, 0x22, 0x33]);
+        // frame 1: FD + BRS, 16 bytes - only correct if frame 0 advanced p exactly
+        assert_eq!(got[1].can_id, 0x200);
+        assert!(got[1].fd);
+        assert_eq!(got[1].fd_flags, CANFD_BRS);
+        assert_eq!(got[1].len, 16);
+        assert_eq!(&got[1].data[..16], &fd.data[..16]);
+        // frame 2: RTR - DLC kept (kvasilloni-f1b), no data; correct only if the
+        // FD frame's extra flags byte + 16 data bytes were all consumed.
+        assert_eq!(got[2].can_id, 0x321 | CAN_RTR_FLAG);
+        assert!(got[2].is_rtr());
+        assert_eq!(got[2].len, 8);
+    }
+
+    #[test]
+    fn parse_udp_truncated_batch_returns_none() {
+        // Header claims 3 frames but only 2 bodies are present: parse_udp's
+        // per-frame bounds check must return None (no panic, no over-read past the
+        // datagram) rather than fabricate a third frame (kvasilloni-im6.3).
+        let a = mk(0x100, &[1, 2]);
+        let b = mk(0x101, &[3, 4]);
+        let pkt = build_udp_batch(&[a, b], 0, 3); // count=3, only 2 bodies
+        assert!(parse_udp(&pkt).is_none(), "an over-claimed count must yield None");
+
+        // The same two frames with a truthful count=2 still parse cleanly.
+        let ok = build_udp_batch(&[a, b], 0, 2);
+        assert_eq!(parse_udp(&ok).unwrap().len(), 2);
     }
 
     /// Drive the streaming decoder the way the TCP RX loop does and confirm it
@@ -594,15 +669,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_udp_huge_count_does_not_over_allocate() {
-        // A 7-byte datagram claiming count=65535 must not pre-allocate for 65535
-        // frames; it has no frame bodies, so parsing returns None gracefully.
-        // (kvasilloni-56p: capacity is bounded by the datagram length.)
+    fn parse_udp_huge_count_no_bodies_is_graceful_none() {
+        // A datagram claiming count=65535 but carrying NO frame bodies parses to
+        // None gracefully - the per-frame bounds check trips on the first missing
+        // body - and never panics. (Renamed from the misleading
+        // *_does_not_over_allocate: this None comes from the per-frame bounds, not
+        // the allocation cap; deleting the cap line still passes here. The cap's
+        // own guarantee is covered by udp_prealloc_cap_clamps_attacker_count.
+        // kvasilloni-im6.2a / -56p.)
         let pkt = vec![0x02, 0x00, 0x00, 0xFF, 0xFF]; // ver, DATA, seq, count=65535
         assert!(parse_udp(&pkt).is_none());
         // A well-formed single-frame packet with the same shape still parses.
         let ok = build_udp(&mk(0x123, &[1, 2, 3]), 0);
         assert_eq!(parse_udp(&ok).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn udp_prealloc_cap_clamps_attacker_count() {
+        // kvasilloni-56p: the pre-allocation hint must be clamped to what the
+        // datagram could physically hold, never the attacker-controlled count. This
+        // is the test actually attributable to the cap line - reverting the clamp to
+        // a bare `count as usize` fails the first assertion (65535 != 2).
+        assert_eq!(udp_prealloc_cap(65535, 7), 7 / FRAME_BASE_SIZE + 1); // 2, not 65535
+        // A truthful count (datagram big enough to hold them) passes through.
+        assert_eq!(udp_prealloc_cap(3, DATA_PACKET_BASE_SIZE + 3 * FRAME_BASE_SIZE), 3);
+        // Never exceeds the physical bound for any count.
+        assert!(udp_prealloc_cap(u16::MAX, 100) <= 100 / FRAME_BASE_SIZE + 1);
     }
 
     #[test]

@@ -134,7 +134,9 @@ run_case() {  # $1=label  $2..=cannelloni args ; CANENV provides shim env
 PROBE_ARGS="0x18EEFF00 ext DE AD BE EF"
 INJECT="18FF0102#01020304"
 TXGREP="18EEFF00#?.*DEADBEEF|18EEFF00#DEADBEEF"
-RXGREP="RX id=0x18FF0102"
+# Assert id AND the exact payload/dlc/flag (kvasilloni-im6.7), not just the id: a
+# receive path delivering the WRONG bytes would otherwise still pass.
+RXGREP="RX id=0x18FF0102 dlc=4 flag=0x4 data=01020304"
 
 # UDP: cannelloni listens 20100, sends to probe at 20101
 CANENV="KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20100 KVASILLONI_LOCALPORT=20101" \
@@ -151,11 +153,47 @@ CANENV="KVASILLONI_PROTO=tcp KVASILLONI_TCPROLE=client KVASILLONI_HOST=127.0.0.1
 PROBE_ARGS="0x18EEFF02 extfdbrs 00 11 22 33 44 55 66 77 88 99 AA BB"
 INJECT="18FF0105##100112233445566778899AABBCCDDEEFF"   # ## => FD, flags nibble 1 = BRS
 TXGREP="18EEFF02##.*001122334455"
-# flag >= 0x10000 (5 hex digits, nonzero lead) => an FD flag bit is set (FDF/BRS/ESI)
-RXGREP="RX id=0x18FF0105 .*flag=0x[1-9a-fA-F][0-9a-fA-F]{4}"
+# Verify wide-payload FD RECEIVE fully (kvasilloni-im6.7): dlc=16 AND the exact
+# 16-byte payload AND the FD+BRS+EXT flag bits (FDF 0x10000 | BRS 0x20000 | EXT
+# 0x4 = 0x30004), not merely "some FD flag bit is set".
+RXGREP="RX id=0x18FF0105 dlc=16 flag=0x30004 data=00112233445566778899AABBCCDDEEFF"
 
 CANENV="KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20104 KVASILLONI_LOCALPORT=20105" \
   run_case "UDP (CAN FD + BRS)" -I "$VCAN" -R 127.0.0.1 -r 20105 -l 20104
+
+# --- classic-opened channel caps a real FD frame at 8 bytes (kvasilloni-nmt e2e) ---
+# A channel opened CLASSIC (flags=0, 8-byte rbuf) must survive a real >8-byte FD
+# frame on the wire: deliver at most 8 bytes, report NO FD flag bit, never crash.
+# This is exactly the path the write_read_outputs cap protects (kvasilloni-im6.4);
+# reverting that cap writes 16 bytes into rbuf[8] and crashes the probe.
+echo; echo "===== CASE: classic channel caps a real FD frame at 8 bytes (--classic-rx, UDP) ====="
+crx_out="$(mktemp)"
+"$CANNBIN" -I "$VCAN" -R 127.0.0.1 -r 20151 -l 20150 >/dev/null 2>&1 & CRXNPID=$!; PIDS+=("$CRXNPID")
+sleep 1.0
+( cd "$BUILD" && KVASILLONI_PROTO=udp KVASILLONI_HOST=127.0.0.1 KVASILLONI_PORT=20150 KVASILLONI_LOCALPORT=20151 \
+    wine ./canshim_probe.exe --classic-rx 0x18FF0160 ext ) > "$crx_out" 2>/dev/null & CRXPBPID=$!; PIDS+=("$CRXPBPID")
+sleep 2.0
+# A 16-byte BRS CAN FD frame to a CLASSIC-opened channel. (## => FD, nibble 1 = BRS)
+cansend "$VCAN" "18FF0160##10102030405060708090A0B0C0D0E0F10" 2>/dev/null
+echo "  injected 16-byte BRS FD frame 18FF0160 to a CLASSIC-opened channel"
+wait "$CRXPBPID" 2>/dev/null; crx_rc=$?
+kill "$CRXNPID" 2>/dev/null
+sleep 0.8
+# (1) the probe must exit cleanly - a stack smash from an un-capped >8-byte copy
+# would crash it (nonzero exit).
+if [ "$crx_rc" = 0 ]; then
+  echo "  PASS: classic-rx probe exited cleanly (survived a >8-byte FD frame)"
+else
+  echo "  FAIL: classic-rx probe crashed/exited nonzero ($crx_rc) on a >8-byte FD frame"; sed 's/^/    /' "$crx_out"; FAIL=1
+fi
+# (2) the delivered frame must be capped to 8 bytes, classic flags (0x4, no FD
+# bit), with the first-8 payload - reverting the cap would show dlc=16 / an FD bit.
+if grep -qE "RX id=0x18FF0160 dlc=8 flag=0x4 data=0102030405060708" "$crx_out"; then
+  echo "  PASS: FD frame capped to 8 bytes with classic flags and correct first-8 payload"
+else
+  echo "  FAIL: classic channel did not cap the FD frame (expected dlc=8 flag=0x4 data=0102030405060708)"; sed 's/^/    /' "$crx_out"; FAIL=1
+fi
+rm -f "$crx_out"
 
 # --- INI-based config (Windows-native): no KVASILLONI_* config env at all ---
 # The shim must auto-discover kvasilloni.ini next to the DLL (ports 20106/20107).
@@ -169,7 +207,7 @@ EOF
 PROBE_ARGS="0x18EEFF03 ext CA FE"
 INJECT="18FF0106#05060708"
 TXGREP="18EEFF03#?.*CAFE"
-RXGREP="RX id=0x18FF0106"
+RXGREP="RX id=0x18FF0106 dlc=4 flag=0x4 data=05060708"  # id + payload (kvasilloni-im6.7)
 CANENV="" \
   run_case "UDP (INI config, no env)" -I "$VCAN" -R 127.0.0.1 -r 20107 -l 20106
 rm -f "$BUILD/kvasilloni.ini"
@@ -202,8 +240,8 @@ echo "  injected: 18FF0201 (accept) and 18FF0202 (reject)"
 wait "$ACPBPID" 2>/dev/null
 kill "$ACNPID" 2>/dev/null
 sleep 0.8
-if grep -qE "RX id=0x18FF0201" "$acc_out" && ! grep -qE "RX id=0x18FF0202" "$acc_out"; then
-  echo "  PASS: only the accepted id reached canRead"
+if grep -qE "RX id=0x18FF0201 dlc=1 flag=0x4 data=AA" "$acc_out" && ! grep -qE "RX id=0x18FF0202" "$acc_out"; then
+  echo "  PASS: only the accepted id reached canRead, with the right payload"
 else
   echo "  FAIL: acceptance filtering wrong"; sed 's/^/    /' "$acc_out"; FAIL=1
 fi
@@ -263,8 +301,8 @@ else
   echo "  --- candump ---"; sed 's/^/    /' "$multi_cap"
   echo "  --- probe ---"; sed 's/^/    /' "$multi_out"; FAIL=1
 fi
-if grep -qE "RXa id=0x18FF0113" "$multi_out"; then
-  echo "  PASS: first channel still receives injected frame"
+if grep -qE "RXa id=0x18FF0113 dlc=1 data=CD" "$multi_out"; then
+  echo "  PASS: first channel still receives injected frame (payload verified)"
 else
   echo "  FAIL: first channel did not receive injected frame"; sed 's/^/    /' "$multi_out"; FAIL=1
 fi
@@ -313,8 +351,8 @@ if command -v python3 >/dev/null 2>&1; then
   wait "$MLPBPID" 2>/dev/null
   kill "$MLNPID" 2>/dev/null
   sleep 0.8
-  if grep -qE "RX id=0x18FF0117" "$mal_out"; then
-    echo "  PASS: RX thread survived the malformed datagram and delivered the valid frame"
+  if grep -qE "RX id=0x18FF0117 dlc=2 flag=0x4 data=0102" "$mal_out"; then
+    echo "  PASS: RX thread survived the malformed datagram and delivered the valid frame (payload verified)"
   else
     echo "  FAIL: valid frame not received after malformed input (RX thread may have died)"; sed 's/^/    /' "$mal_out"; FAIL=1
   fi
@@ -348,8 +386,8 @@ echo "  injected 18FF0150 with peer check OFF (should deliver)"
 wait "$PCPB2" 2>/dev/null
 kill "$PCNPID" 2>/dev/null
 sleep 0.8
-if ! grep -qE "RX id=0x18FF0150" "$pc_out1" && grep -qE "RX id=0x18FF0150" "$pc_out2"; then
-  echo "  PASS: non-allowed source dropped with peer check on, delivered with it off"
+if ! grep -qE "RX id=0x18FF0150" "$pc_out1" && grep -qE "RX id=0x18FF0150 dlc=1 flag=0x4 data=11" "$pc_out2"; then
+  echo "  PASS: non-allowed source dropped with peer check on, delivered (payload verified) with it off"
 else
   echo "  FAIL: peer check wrong (on must drop, off must deliver)"
   echo "  --- check on ---"; sed 's/^/    /' "$pc_out1"
@@ -424,8 +462,8 @@ else
   echo "  FAIL: probe TX not seen on $VCAN"; echo "  --- candump ---"; sed 's/^/    /' "$srv_cap"
   echo "  --- probe ---"; sed 's/^/    /' "$srv_out"; FAIL=1
 fi
-if grep -qE "RX id=0x18FF0140" "$srv_out"; then
-  echo "  PASS: injected frame delivered to probe canRead (server RX)"
+if grep -qE "RX id=0x18FF0140 dlc=1 flag=0x4 data=42" "$srv_out"; then
+  echo "  PASS: injected frame delivered to probe canRead (server RX, payload verified)"
 else
   echo "  FAIL: probe did not receive injected frame (server RX)"; sed 's/^/    /' "$srv_out"; FAIL=1
 fi
@@ -481,13 +519,13 @@ if [ "$pwx_ok" = 1 ]; then
   else
     echo "  FAIL: distinct handles not reported"; sed 's/^/    /' "$mrx_out"; FAIL=1
   fi
-  if grep -qE "RXa id=0x18FF01A0" "$mrx_out" && ! grep -qE "RXa id=0x18FF01B0" "$mrx_out"; then
-    echo "  PASS: channel A received only its own frame (no leak from B)"
+  if grep -qE "RXa id=0x18FF01A0 dlc=1 data=A1" "$mrx_out" && ! grep -qE "RXa id=0x18FF01B0" "$mrx_out"; then
+    echo "  PASS: channel A received only its own frame, payload verified (no leak from B)"
   else
     echo "  FAIL: channel A RX isolation broken"; sed 's/^/    /' "$mrx_out"; FAIL=1
   fi
-  if grep -qE "RXb id=0x18FF01B0" "$mrx_out" && ! grep -qE "RXb id=0x18FF01A0" "$mrx_out"; then
-    echo "  PASS: channel B received only its own frame (no leak from A)"
+  if grep -qE "RXb id=0x18FF01B0 dlc=1 data=B1" "$mrx_out" && ! grep -qE "RXb id=0x18FF01A0" "$mrx_out"; then
+    echo "  PASS: channel B received only its own frame, payload verified (no leak from A)"
   else
     echo "  FAIL: channel B RX isolation broken"; sed 's/^/    /' "$mrx_out"; FAIL=1
   fi

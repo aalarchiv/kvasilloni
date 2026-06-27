@@ -31,6 +31,11 @@
  *       labelled by channel, proving per-channel RX isolation (kvasilloni-pwx).
  *   canshim_probe.exe --stress <threads> <iters>
  *       hammer open/write/read/close from N threads at once (kvasilloni-eoq).
+ *   canshim_probe.exe --classic-rx <hex_id> <std|ext>
+ *       open the channel CLASSIC (flags=0) with an 8-byte rx buffer and poll
+ *       canRead, printing each RX. Proves a real >8-byte FD frame on the wire is
+ *       capped to <=8 bytes and reported classic, so a classic app's 8-byte
+ *       buffer is never overrun (kvasilloni-nmt / -im6.4).
  */
 #include <windows.h>
 #include <stdio.h>
@@ -81,6 +86,7 @@ static int run_notify_close(HMODULE dll);
 static int run_timed_open(HMODULE dll);
 static int run_multi_rx(HMODULE dll, int argc, char **argv);
 static int run_stress(HMODULE dll, int argc, char **argv);
+static int run_classic_rx(HMODULE dll, int argc, char **argv);
 
 int main(int argc, char **argv)
 {
@@ -117,6 +123,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--timed-open")) return run_timed_open(dll);
     if (argc > 1 && !strcmp(argv[1], "--multi-rx")) return run_multi_rx(dll, argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--stress"))  return run_stress(dll, argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--classic-rx")) return run_classic_rx(dll, argc, argv);
 
 #define GET(v, t, n) v = (t)GetProcAddress(dll, n); \
     if (!v) { fprintf(stderr, "PROBE: missing export %s\n", n); return 2; }
@@ -217,8 +224,10 @@ static int run_accept(HMODULE dll, int argc, char **argv)
         long rid; unsigned rdlc, rflag; unsigned long t;
         unsigned char rbuf[8];
         if (p_read(h, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
-            printf("PROBE: RX id=0x%lX dlc=%u flag=0x%x\n", rid, rdlc, rflag);
-            fflush(stdout);
+            unsigned j;
+            printf("PROBE: RX id=0x%lX dlc=%u flag=0x%x data=", rid, rdlc, rflag);
+            for (j = 0; j < rdlc && j < 8; j++) printf("%02X", rbuf[j]);
+            printf("\n"); fflush(stdout);
         } else {
             Sleep(10);
         }
@@ -293,8 +302,10 @@ static int run_multi(HMODULE dll, int argc, char **argv)
     for (loops = 0; loops < 500; loops++) {
         long rid; unsigned rdlc, rflag; unsigned long t; unsigned char rbuf[8];
         if (p_read(ha, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
-            printf("PROBE: RXa id=0x%lX dlc=%u\n", rid, rdlc);
-            fflush(stdout);
+            unsigned j;
+            printf("PROBE: RXa id=0x%lX dlc=%u data=", rid, rdlc);
+            for (j = 0; j < rdlc && j < 8; j++) printf("%02X", rbuf[j]);
+            printf("\n"); fflush(stdout);
         } else {
             Sleep(10);
         }
@@ -414,11 +425,16 @@ static int run_multi_rx(HMODULE dll, int argc, char **argv)
     if (p_buson)  { p_buson(ha); p_buson(hb); }
     for (loops = 0; loops < 500; loops++) {
         long rid; unsigned rdlc, rflag; unsigned long t; unsigned char rbuf[8];
+        unsigned j;
         if (p_read(ha, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
-            printf("PROBE: RXa id=0x%lX\n", rid); fflush(stdout);
+            printf("PROBE: RXa id=0x%lX dlc=%u data=", rid, rdlc);
+            for (j = 0; j < rdlc && j < 8; j++) printf("%02X", rbuf[j]);
+            printf("\n"); fflush(stdout);
         }
         if (p_read(hb, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
-            printf("PROBE: RXb id=0x%lX\n", rid); fflush(stdout);
+            printf("PROBE: RXb id=0x%lX dlc=%u data=", rid, rdlc);
+            for (j = 0; j < rdlc && j < 8; j++) printf("%02X", rbuf[j]);
+            printf("\n"); fflush(stdout);
         }
         Sleep(10);
     }
@@ -488,6 +504,49 @@ static int run_stress(HMODULE dll, int argc, char **argv)
     printf("PROBE: STRESS threads=%d iters=%d fail=%ld ok=%d\n",
            nthreads, iters, g_st_fail, (g_st_fail == 0) ? 1 : 0);
     fflush(stdout);
+    FreeLibrary(dll);
+    return 0;
+}
+
+/* --classic-rx <hex_id> <std|ext> : open the channel CLASSIC (flags=0) with an
+ * 8-byte receive buffer - exactly what a non-FD app provides - and poll canRead.
+ * A real CAN FD frame (up to 64 bytes) on the wire must be capped to <=8 bytes and
+ * reported with classic semantics (no FD flag bit), so those 8 bytes never overrun
+ * this rbuf[8] (kvasilloni-nmt). The hex_id/std|ext args are accepted for symmetry
+ * with the other modes but are not needed: the channel receives whatever cansend
+ * injects. If the cap regressed, writing >8 bytes into rbuf[8] would smash the
+ * stack and crash the probe (a nonzero exit the selftest detects). */
+static int run_classic_rx(HMODULE dll, int argc, char **argv)
+{
+    fn_init   p_init   = (fn_init)  GetProcAddress(dll, "canInitializeLibrary");
+    fn_open   p_open   = (fn_open)  GetProcAddress(dll, "canOpenChannel");
+    fn_setbus p_setbus = (fn_setbus)GetProcAddress(dll, "canSetBusParams");
+    fn_buson  p_buson  = (fn_buson) GetProcAddress(dll, "canBusOn");
+    fn_read   p_read   = (fn_read)  GetProcAddress(dll, "canRead");
+    fn_close  p_close  = (fn_close) GetProcAddress(dll, "canClose");
+    int h, loops;
+    (void)argc; (void)argv; /* id/std|ext are informational only for this mode */
+    if (!p_open || !p_read) { fprintf(stderr, "PROBE: classic-rx exports missing\n"); return 2; }
+    if (p_init) p_init();
+    h = p_open(0, 0); /* CLASSIC: flags=0, so the shim caps RX delivery at 8 bytes */
+    if (h < 0) { fprintf(stderr, "PROBE: canOpenChannel failed %d\n", h); return 3; }
+    if (p_setbus) p_setbus(h, 250000, 0, 0, 0, 0, 0);
+    if (p_buson) p_buson(h);
+    printf("PROBE: CLASSICRX armed (8-byte buffer)\n");
+    fflush(stdout);
+    for (loops = 0; loops < 500; loops++) {
+        long rid; unsigned rdlc, rflag; unsigned long t;
+        unsigned char rbuf[8]; /* a classic app's buffer: exactly 8 bytes */
+        if (p_read(h, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
+            unsigned j;
+            printf("PROBE: RX id=0x%lX dlc=%u flag=0x%x data=", rid, rdlc, rflag);
+            for (j = 0; j < rdlc && j < 8; j++) printf("%02X", rbuf[j]);
+            printf("\n"); fflush(stdout);
+        } else {
+            Sleep(10);
+        }
+    }
+    if (p_close) p_close(h);
     FreeLibrary(dll);
     return 0;
 }

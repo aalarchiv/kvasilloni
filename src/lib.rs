@@ -793,6 +793,15 @@ pub extern "system" fn canSetNotify(
 mod tests {
     use super::*;
 
+    /// Serializes every test that opens a real channel in the global `CONNS` table.
+    /// Two reasons (kvasilloni-im6.6): (1) `stress_concurrent_open_write_read_close`
+    /// asserts `CONNS` is empty at the end, which any other open channel would
+    /// violate; (2) a channel opened on the default local port (:20000) would
+    /// receive the stress test's `canWrite` datagrams (sent to :20000) as stray RX.
+    /// Holding this lock for the whole test keeps these channel-owning tests from
+    /// overlapping. Poison-tolerant so one test's panic doesn't cascade.
+    static CONNS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn bus_output_control_roundtrips() {
         assert_eq!(canSetBusOutputControl(1, 1 /* SILENT */), CAN_OK);
@@ -818,10 +827,13 @@ mod tests {
 
     #[test]
     fn number_of_channels_defaults_to_one() {
-        // No KVASILLONI_CHANNELS / ini in the test env -> default 1.
+        // No KVASILLONI_CHANNELS / ini in the test env -> default is exactly 1.
+        // Assert == 1, not >= 1: no other test sets ENUM_CHANNELS, so a wrong
+        // default (or a botched memo returning a stale/garbage count) is caught
+        // here rather than passing a lenient lower bound (kvasilloni-im6.2d).
         let mut n: c_int = -1;
         assert_eq!(canGetNumberOfChannels(&mut n), CAN_OK);
-        assert!(n >= 1);
+        assert_eq!(n, 1, "default channel count must be exactly 1");
     }
 
     #[test]
@@ -980,6 +992,7 @@ mod tests {
         // with no cannelloni (they just bind a socket and spawn the RX loop);
         // writes go nowhere and reads return NOMSG. Bounded modestly because each
         // close joins an RX thread parked on a 500ms read timeout.
+        let _isolation = CONNS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const THREADS: i32 = 8;
         const OUTER: i32 = 6; // open/close cycles per thread
         const INNER: i32 = 40; // write/read ops per open
@@ -1098,5 +1111,233 @@ mod tests {
         assert_eq!(out_u32(p, small.len(), 0xAABBCCDD), CAN_ERR_PARAM); // too small
         assert_eq!(out_u32(std::ptr::null_mut(), 4, 0), CAN_ERR_PARAM); // null
         assert_eq!(out_cstr(p, 0, "x"), CAN_ERR_PARAM); // zero len
+    }
+
+    // ============ kvasilloni-im6.6: FFI-boundary tests for under-tested exports ============
+    // Open a real channel over loopback UDP (cfg!(test) enables the ephemeral-port
+    // fallback, so the bind + RX thread come up with no cannelloni peer) and inject
+    // RX frames directly via the channel's Shared::push. This exercises the success
+    // and edge values of exports previously hit only on the INVHANDLE/error path.
+    use std::net::UdpSocket;
+
+    fn open_loopback_channel() -> c_int {
+        let h = canOpenChannel(0, 0);
+        assert!(h > 0, "canOpenChannel failed: {h}");
+        h
+    }
+
+    fn conn_for(hnd: c_int) -> Arc<Conn> {
+        CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd).expect("open channel").clone()
+    }
+
+    fn rx_frame(can_id: u32, data: &[u8]) -> Frame {
+        let mut f = Frame::default();
+        f.can_id = can_id;
+        f.len = data.len() as u8;
+        f.data[..data.len()].copy_from_slice(data);
+        f
+    }
+
+    #[test]
+    fn read_status_reports_pending_and_overrun() {
+        // kvasilloni-tlm: canReadStatus maps queued frames to RX_PENDING and a
+        // dropped-frame ring overflow to the sticky SW_OVERRUN bit.
+        let _isolation = CONNS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = open_loopback_channel();
+        let mut flags: c_ulong = 0xFFFF;
+        assert_eq!(canReadStatus(h, &mut flags), CAN_OK);
+        assert_eq!(flags, 0, "a freshly opened channel reports no RX state");
+
+        let shared = conn_for(h).rx_shared();
+        shared.push(rx_frame(0x123, &[0xAA]));
+        canReadStatus(h, &mut flags);
+        assert_ne!(flags & CAN_STAT_RX_PENDING, 0, "a queued frame must set RX_PENDING");
+        assert_eq!(flags & CAN_STAT_SW_OVERRUN, 0, "no overrun before the ring fills");
+
+        // Fill past the ring cap (RING_CAP = 8192 in transport.rs) so frames drop
+        // and the software-overrun latch is set.
+        for i in 0..9000u32 {
+            shared.push(rx_frame(0x200 + (i & 0xFF), &[0]));
+        }
+        canReadStatus(h, &mut flags);
+        assert_ne!(flags & CAN_STAT_SW_OVERRUN, 0, "a full ring must latch SW_OVERRUN");
+
+        // Unknown handle is deliberately lenient: flags cleared to 0, returns CAN_OK.
+        let mut bad: c_ulong = 0xDEAD;
+        assert_eq!(canReadStatus(-999, &mut bad), CAN_OK);
+        assert_eq!(bad, 0);
+
+        canClose(h);
+    }
+
+    #[test]
+    fn ioctl_rx_buffer_level_and_flush() {
+        // canIOCTL_GET_RX_BUFFER_LEVEL (func 8) reports the queue depth;
+        // canIOCTL_FLUSH_RX_BUFFER (func 10) drains it to zero.
+        let _isolation = CONNS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = open_loopback_channel();
+        let shared = conn_for(h).rx_shared();
+        for i in 0..5u32 {
+            shared.push(rx_frame(0x100 + i, &[i as u8]));
+        }
+
+        let mut level: u32 = 0;
+        let p = &mut level as *mut u32 as *mut c_void;
+        assert_eq!(canIoCtl(h, 8, p, 4), CAN_OK); // GET_RX_BUFFER_LEVEL
+        assert_eq!(level, 5, "buffer level must equal the queued frame count");
+
+        assert_eq!(canIoCtl(h, 10, std::ptr::null_mut(), 0), CAN_OK); // FLUSH_RX_BUFFER
+        level = 0xFFFF;
+        canIoCtl(h, 8, p, 4);
+        assert_eq!(level, 0, "FLUSH_RX must drain the ring to 0");
+        canClose(h);
+    }
+
+    #[test]
+    fn read_wait_returns_pushed_frame_else_nomsg() {
+        // canReadWait success path: a queued frame is delivered with its id / dlc /
+        // data; an empty queue returns NOMSG after the (short) wait.
+        let _isolation = CONNS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = open_loopback_channel();
+        let shared = conn_for(h).rx_shared();
+        shared.push(rx_frame(0x18FF0102 | wire::CAN_EFF_FLAG, &[1, 2, 3, 4]));
+
+        let mut id: c_long = 0;
+        let (mut dlc, mut flag): (c_uint, c_uint) = (0, 0);
+        let mut time: c_ulong = 0;
+        let mut buf = [0u8; 8];
+        let st = canReadWait(
+            h,
+            &mut id,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut dlc,
+            &mut flag,
+            &mut time,
+            200,
+        );
+        assert_eq!(st, CAN_OK);
+        assert_eq!(id, 0x18FF0102);
+        assert_ne!(flag & wire::CAN_MSG_EXT, 0, "extended id flag must be reported");
+        assert_eq!(dlc, 4);
+        assert_eq!(&buf[..4], &[1, 2, 3, 4]);
+
+        let st = canReadWait(
+            h,
+            &mut id,
+            buf.as_mut_ptr() as *mut c_void,
+            &mut dlc,
+            &mut flag,
+            &mut time,
+            50,
+        );
+        assert_eq!(st, CAN_ERR_NOMSG, "empty queue must return NOMSG");
+        canClose(h);
+    }
+
+    #[test]
+    fn channel_data_cap_advertises_fd_extended_virtual() {
+        // kvasilloni-vsd: apps gate CAN FD on CHANNEL_CAP, so the mask must carry
+        // the CAN_FD, EXTENDED_CAN, and VIRTUAL bits.
+        let mut cap: u32 = 0;
+        let p = &mut cap as *mut u32 as *mut c_void;
+        assert_eq!(canGetChannelData(0, 1 /* CHANNEL_CAP */, p, 4), CAN_OK);
+        assert_ne!(cap & CAN_CHANNEL_CAP_CAN_FD, 0, "must advertise CAN FD");
+        assert_ne!(cap & CAN_CHANNEL_CAP_EXTENDED_CAN, 0, "must advertise extended IDs");
+        assert_ne!(cap & CAN_CHANNEL_CAP_VIRTUAL, 0, "must advertise a virtual channel");
+    }
+
+    #[test]
+    fn error_text_truncates_nul_terminates_and_handles_edges() {
+        // Into a 4-byte buffer: the message is truncated to 3 chars + a NUL, and
+        // nothing is written past bufsiz.
+        let mut buf = [0xAAu8; 8];
+        assert_eq!(canGetErrorText(CAN_ERR_NOMSG, buf.as_mut_ptr() as *mut c_char, 4), CAN_OK);
+        assert_eq!(&buf[..3], b"No ", "first 3 chars of 'No messages available'");
+        assert_eq!(buf[3], 0, "must NUL-terminate at bufsiz-1");
+        assert!(buf[4..].iter().all(|&b| b == 0xAA), "must not write past bufsiz");
+
+        // bufsiz = 0: the buffer is left completely untouched.
+        let mut buf0 = [0xAAu8; 4];
+        assert_eq!(canGetErrorText(CAN_OK, buf0.as_mut_ptr() as *mut c_char, 0), CAN_OK);
+        assert!(buf0.iter().all(|&b| b == 0xAA), "bufsiz=0 must not touch the buffer");
+
+        // Unknown error code -> "Unknown error".
+        let mut ubuf = [0u8; 32];
+        assert_eq!(
+            canGetErrorText(-12345, ubuf.as_mut_ptr() as *mut c_char, ubuf.len() as c_uint),
+            CAN_OK
+        );
+        let s = std::ffi::CStr::from_bytes_until_nul(&ubuf).unwrap().to_str().unwrap();
+        assert_eq!(s, "Unknown error");
+    }
+
+    #[test]
+    fn read_outputs_rtr_reports_dlc_without_copying_data() {
+        // write_read_outputs on an RTR frame: the DLC and RTR flag are reported but
+        // NO data bytes are copied into the caller's buffer (RTR carries no payload).
+        let mut f = Frame::default();
+        f.can_id = 0x123 | wire::CAN_RTR_FLAG;
+        f.len = 8; // RTR DLC, no data
+        let mut buf = [0xEEu8; 8];
+        let mut id: c_long = 0;
+        let (mut dlc, mut flag): (c_uint, c_uint) = (0, 0);
+        let mut time: c_ulong = 0;
+        unsafe {
+            write_read_outputs(
+                &f,
+                &mut id,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut dlc,
+                &mut flag,
+                &mut time,
+                false,
+            );
+        }
+        assert_eq!(id, 0x123);
+        assert_ne!(flag & wire::CAN_MSG_RTR, 0, "RTR flag must be reported");
+        assert_eq!(dlc, 8, "RTR DLC must be reported");
+        assert!(buf.iter().all(|&b| b == 0xEE), "RTR must not copy any data into the buffer");
+    }
+
+    #[test]
+    fn write_frame_rtr_sends_dlc_but_no_payload() {
+        // canWrite of an RTR frame must put the DLC on the wire but NO data bytes,
+        // even when a non-null msg + dlc are supplied. Point a UDP channel at a
+        // receiver we control and inspect the emitted datagram end-to-end.
+        let _isolation = CONNS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rx_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_port = rx_sock.local_addr().unwrap().port();
+        rx_sock.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+        let cfg = Config {
+            host: "127.0.0.1".into(),
+            remote_port: rx_port,
+            local_port: 0, // ephemeral source; we only care about the TX direction
+            ..Config::default()
+        };
+        let conn = Conn::connect(&cfg).expect("udp connect");
+        let hnd = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
+        CONNS.lock().unwrap_or_else(|e| e.into_inner()).insert(hnd, Arc::new(conn));
+
+        let mut data = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        let st = canWrite(
+            hnd,
+            0x123,
+            data.as_mut_ptr() as *mut c_void,
+            8, // DLC 8...
+            wire::CAN_MSG_STD | wire::CAN_MSG_RTR, // ...but RTR: no payload on the wire
+        );
+        assert_eq!(st, CAN_OK);
+
+        let mut buf = [0u8; 64];
+        let (n, _) = rx_sock.recv_from(&mut buf).expect("RTR datagram");
+        // header(5) + can_id(4) + len(1) = 10 bytes, no data section.
+        assert_eq!(n, 10, "RTR datagram must carry the DLC but no data bytes");
+        let frames = wire::parse_udp(&buf[..n]).expect("parse RTR datagram");
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_rtr(), "RTR flag must survive onto the wire");
+        assert_eq!(frames[0].len, 8, "RTR DLC must be sent");
+
+        canClose(hnd);
     }
 }

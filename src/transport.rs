@@ -167,7 +167,9 @@ impl Shared {
 
     /// Producer side: apply acceptance filtering, enqueue (dropping when full),
     /// wake any blocked reader, then fire the notify callback if armed for RX.
-    fn push(&self, mut f: Frame) {
+    /// `pub` so tests can inject RX frames without a live peer (kvasilloni-im6.6);
+    /// in production only the RX loops call it.
+    pub fn push(&self, mut f: Frame) {
         if !self.filters.lock().unwrap_or_else(|e| e.into_inner()).accepts(&f) {
             return;
         }
@@ -801,14 +803,23 @@ mod tests {
 
     #[test]
     fn push_stamps_receive_timestamp() {
-        // kvasilloni-kha: an enqueued frame carries a non-default RX timestamp so
-        // canRead/canReadWait can report it. (now_ms is monotonic from first use.)
+        // kvasilloni-kha: an enqueued frame is stamped with the receive time.
+        // Bracket the push between two now_ms() reads and assert the stamp lands in
+        // [t0, t1] - not merely >0, which a hard-coded constant would also satisfy
+        // (kvasilloni-im6.2c). The 2ms sleep guarantees t0 > 0 so an un-stamped
+        // (rx_time_ms == 0) frame is actually rejected by the lower bound.
         let s = Shared::new();
-        let _ = now_ms(); // ensure the epoch is initialized before we sleep
-        std::thread::sleep(Duration::from_millis(2));
+        let _ = now_ms(); // initialize the monotonic epoch
+        std::thread::sleep(Duration::from_millis(2)); // let it advance so t0 > 0
+        let t0 = now_ms();
         s.push(frame(0x7FF));
+        let t1 = now_ms();
         let f = s.pop().expect("frame");
-        assert!(f.rx_time_ms > 0, "receive timestamp was not stamped");
+        assert!(
+            t0 <= f.rx_time_ms && f.rx_time_ms <= t1,
+            "stamp {} not within the push window [{t0}, {t1}]",
+            f.rx_time_ms
+        );
     }
 
     #[test]
@@ -915,51 +926,93 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
-    static NOTIFY_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static NOTIFY_LAST_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    // Each notify test owns a private callback + statics so nothing mutable is
+    // shared across tests. `cargo test` runs them on parallel threads; a shared
+    // counter (as before) let one test's store(0)/increments bleed into another's
+    // assert - a latent flake that passed only by luck (kvasilloni-im6.1).
+    static FIRES_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static FIRES_LAST_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-    extern "system" fn test_cb(d: *mut NotifyData) {
+    extern "system" fn cb_fires(d: *mut NotifyData) {
         unsafe {
-            NOTIFY_COUNT.fetch_add(1, Ordering::SeqCst);
-            NOTIFY_LAST_ID.store((*d).id as i64, Ordering::SeqCst);
+            FIRES_COUNT.fetch_add(1, Ordering::SeqCst);
+            FIRES_LAST_ID.store((*d).id as i64, Ordering::SeqCst);
         }
+    }
+
+    static SILENT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "system" fn cb_silent(_d: *mut NotifyData) {
+        SILENT_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
     #[test]
     fn notify_fires_for_each_rx_when_armed() {
         let s = Shared::new();
-        NOTIFY_COUNT.store(0, Ordering::SeqCst);
-        s.set_notify(test_cb as *const () as usize, NOTIFY_RX, 0);
+        s.set_notify(cb_fires as *const () as usize, NOTIFY_RX, 0);
         s.push(frame(0x111));
         s.push(frame(0x222));
-        assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 2);
-        assert_eq!(NOTIFY_LAST_ID.load(Ordering::SeqCst), 0x222);
+        assert_eq!(FIRES_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(FIRES_LAST_ID.load(Ordering::SeqCst), 0x222);
         // Disarm: no further callbacks.
         s.set_notify(0, 0, 0);
         s.push(frame(0x333));
-        assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(FIRES_COUNT.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn notify_silent_when_flag_not_set() {
         let s = Shared::new();
-        NOTIFY_COUNT.store(0, Ordering::SeqCst);
-        s.set_notify(test_cb as *const () as usize, 0 /* no NOTIFY_RX */, 0);
+        s.set_notify(cb_silent as *const () as usize, 0 /* no NOTIFY_RX */, 0);
         s.push(frame(0x111));
-        assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(SILENT_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    // A callback that disarms ITSELF by calling set_notify(0,0,0) on its own Shared,
+    // reached via a raw pointer the test parks here. Fired through a real push() so
+    // CbScope is genuinely entered (the old test just poked IN_NOTIFY_CB directly,
+    // never exercising the real re-entrancy path). kvasilloni-4vc / -im6.2b.
+    static REENTRANT_SHARED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static REENTRANT_FIRES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    extern "system" fn cb_disarms_self(_d: *mut NotifyData) {
+        REENTRANT_FIRES.fetch_add(1, Ordering::SeqCst);
+        let p = REENTRANT_SHARED.load(Ordering::SeqCst);
+        if p != 0 {
+            // SAFETY: the test parks a pointer to its live Shared here and clears it
+            // before that Shared is dropped, so this deref is valid for the call.
+            let s = unsafe { &*(p as *const Shared) };
+            s.set_notify(0, 0, 0); // re-entrant disarm: runs while push holds cb_active
+        }
     }
 
     #[test]
     fn set_notify_reentrant_does_not_deadlock() {
-        // kvasilloni-4vc: a callback that re-arms/disarms itself runs set_notify
-        // on the RX thread while it already holds cb_active. set_notify must skip
-        // the drain in that case rather than self-deadlock.
+        // kvasilloni-4vc: a callback that re-arms/disarms itself runs set_notify on
+        // the RX thread while push() already holds cb_active. set_notify must skip
+        // the cb_active drain (IN_NOTIFY_CB is set by CbScope) instead of joining
+        // the lock against itself. Drive it through a REAL push so CbScope is
+        // actually entered, then prove (a) push returned - reaching the asserts
+        // means no hang - and (b) the disarm took effect.
         let s = Shared::new();
-        IN_NOTIFY_CB.with(|f| f.set(true)); // simulate "inside a callback on this thread"
-        s.set_notify(0, 0, 0); // would block forever on cb_active without the skip
-        IN_NOTIFY_CB.with(|f| f.set(false));
-        // and a normal (non-reentrant) call still works
-        s.set_notify(0, 0, 0);
+        REENTRANT_FIRES.store(0, Ordering::SeqCst);
+        REENTRANT_SHARED.store(&*s as *const Shared as usize, Ordering::SeqCst);
+        s.set_notify(cb_disarms_self as *const () as usize, NOTIFY_RX, 0);
+
+        s.push(frame(0x123)); // fires cb_disarms_self inside CbScope; must return
+        assert_eq!(REENTRANT_FIRES.load(Ordering::SeqCst), 1, "callback should fire once");
+        assert_eq!(
+            s.notify.lock().unwrap_or_else(|e| e.into_inner()).cb,
+            0,
+            "the callback's self-disarm did not take effect"
+        );
+
+        // Disarmed: a further push must not fire it again.
+        s.push(frame(0x124));
+        assert_eq!(REENTRANT_FIRES.load(Ordering::SeqCst), 1, "disarm did not stop callbacks");
+        REENTRANT_SHARED.store(0, Ordering::SeqCst); // drop the dangling pointer
     }
 
     static SLOW_CB_STARTED: AtomicBool = AtomicBool::new(false);
@@ -1028,15 +1081,264 @@ mod tests {
 
     #[test]
     fn notify_data_field_order() {
-        // The strict Windows offsets/size are checked at compile time by the
-        // #[cfg(windows)] const assertion next to NotifyData. Here, on the host
-        // build, assert the platform-independent invariant: `time` immediately
-        // follows `id` by one `c_long`, matching canNotifyData.info.rx layout.
+        // The ABI that actually ships is the Windows one, and it is locked at
+        // COMPILE TIME by the `#[cfg(windows)] const _: () = { ... }` block next to
+        // the NotifyData definition (transport.rs, just below the struct): it
+        // asserts offset_of!(NotifyData, id) / (NotifyData, time) and size_of for
+        // BOTH the 32- and 64-bit Windows targets. That const-assert - not this
+        // test - is the real guard; a bad field edit fails the Windows cross-build,
+        // not merely this host test. On the host build c_long is 64-bit, so those
+        // exact Windows offsets do not apply; here we assert only the
+        // platform-independent invariant that `time` immediately follows `id` by
+        // one c_long, matching canNotifyData.info.rx. (kvasilloni-im6.2e)
         use std::mem::offset_of;
         assert!(offset_of!(NotifyData, time) > offset_of!(NotifyData, id));
         assert_eq!(
             offset_of!(NotifyData, time) - offset_of!(NotifyData, id),
             std::mem::size_of::<c_long>()
         );
+    }
+
+    // ===================== kvasilloni-im6.5: fast network-layer tests =====================
+    // These drive the real UDP/TCP paths over loopback 127.0.0.1 sockets - no vcan,
+    // cannelloni, or wine. They give `cargo test` coverage of code that previously
+    // only ran in the slow e2e selftest. cfg!(test) force-enables the UDP ephemeral
+    // fallback, and 127.0.0.0/8 is all loopback (so 127.0.0.2 is a usable 2nd source
+    // IP for the peer filter).
+
+    fn loopback_v4() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
+    }
+
+    /// A connected loopback TCP pair: (client side, server-accepted side).
+    fn loopback_tcp_pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = l.accept().unwrap();
+        (client, server)
+    }
+
+    /// Grab an OS-assigned TCP port, then release it so a Conn can rebind it. Small
+    /// TOCTOU window, fine for a loopback test.
+    fn free_tcp_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A loopback TCP Config. `server` picks the role; peer_check is off so the
+    /// loopback peer is always allowed; timeouts are short to keep the test snappy.
+    fn tcp_cfg(server: bool, remote: u16, local: u16) -> Config {
+        Config {
+            host: "127.0.0.1".into(),
+            remote_port: remote,
+            local_port: local,
+            tcp: true,
+            tcp_server: server,
+            peer_check: false,
+            connect_timeout_ms: 1000,
+            accept_timeout_ms: 5000,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn udp_rx_loop_filters_peer_and_enqueues_allowed() {
+        // The UDP RX loop must enqueue a datagram from an allowed source and DROP
+        // one from any other (cannelloni's -R default; kvasilloni-872). Two distinct
+        // loopback source IPs make the filter observable with no real peer.
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let allowed = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let denied = UdpSocket::bind("127.0.0.2:0").unwrap(); // 127.0.0.2: loopback, 2nd IP
+
+        let rx = Shared::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let allow = vec![loopback_v4()]; // 127.0.0.1 only
+        let (rxq, run) = (rx.clone(), running.clone());
+        let h = std::thread::spawn(move || udp_rx_loop(server, rxq, run, allow, true));
+
+        denied.send_to(&wire::build_udp(&frame(0x222), 0), server_addr).unwrap();
+        allowed.send_to(&wire::build_udp(&frame(0x123), 0), server_addr).unwrap();
+
+        let f = rx.pop_wait(Duration::from_secs(2)).expect("allowed frame must be enqueued");
+        assert_eq!(f.can_id, 0x123, "wrong frame delivered");
+        std::thread::sleep(Duration::from_millis(80)); // let the denied datagram (not) land
+        assert!(rx.pop().is_none(), "a datagram from a disallowed source was enqueued");
+
+        running.store(false, Ordering::SeqCst);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_rx_loop_reassembles_dribbled_frame_then_exits_on_error() {
+        // A frame written one byte at a time must still reassemble (read_exact
+        // coalesces across the dribbled writes), and a stream that decodes to
+        // Decoded::Error must make the loop exit ON ITS OWN - no running=false.
+        let (mut peer, conn_side) = loopback_tcp_pair();
+        let rx = Shared::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let (rxq, run) = (rx.clone(), running.clone());
+        let h = std::thread::spawn(move || tcp_rx_loop(conn_side, rxq, run));
+
+        let mut enc = Vec::new();
+        wire::encode_frame(&mut enc, &frame(0x456));
+        for b in &enc {
+            peer.write_all(&[*b]).unwrap();
+            peer.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let f = rx.pop_wait(Duration::from_secs(2)).expect("dribbled frame must reassemble");
+        assert_eq!(f.can_id, 0x456);
+
+        // A classic frame claiming len=9 (> 8) decodes to Decoded::Error: the loop
+        // tears down the unresyncable stream and returns. join() proves it exited.
+        peer.write_all(&[0x00, 0x00, 0x01, 0x00, 9]).unwrap();
+        peer.flush().unwrap();
+        h.join().unwrap();
+        assert!(running.load(Ordering::SeqCst), "loop must exit on Error, not via running=false");
+    }
+
+    #[test]
+    fn conn_tcp_exchanges_frame_both_directions() {
+        // A server-role and a client-role Conn over loopback complete the handshake
+        // and pass one frame each way end-to-end - the real connect/encode/decode
+        // path, fast.
+        let port = free_tcp_port();
+        let server_cfg = tcp_cfg(true, port, port);
+        let client_cfg = tcp_cfg(false, port, 0);
+
+        let sh = std::thread::spawn(move || Conn::connect(&server_cfg).expect("server connect"));
+        std::thread::sleep(Duration::from_millis(150)); // let the server bind + listen
+        let client = Conn::connect(&client_cfg).expect("client connect");
+        let server = sh.join().unwrap();
+
+        client.write(&frame(0x321)).expect("client write");
+        let got = server.rx_shared().pop_wait(Duration::from_secs(2)).expect("server received");
+        assert_eq!(got.can_id, 0x321);
+
+        server.write(&frame(0x654)).expect("server write");
+        let got = client.rx_shared().pop_wait(Duration::from_secs(2)).expect("client received");
+        assert_eq!(got.can_id, 0x654);
+
+        client.close();
+        server.close();
+    }
+
+    #[test]
+    fn conn_connect_rejects_non_ip_host() {
+        let mut cfg = tcp_cfg(false, 20000, 0);
+        cfg.host = "not-an-ip".into();
+        // Conn isn't Debug, so unwrap_err() won't compile; pull the error via .err().
+        let err = Conn::connect(&cfg).err().expect("a non-IP host must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn conn_tcp_write_error_tears_down_connection() {
+        // No coverage anywhere today: a failed TCP write must clear is_ready and
+        // shut the socket down, so the app reopens instead of streaming more bytes
+        // into a desynced (mid-frame) connection (kvasilloni-lo7).
+        let port = free_tcp_port();
+        let server_cfg = tcp_cfg(true, port, port);
+        let client_cfg = tcp_cfg(false, port, 0);
+        let sh = std::thread::spawn(move || Conn::connect(&server_cfg).expect("server connect"));
+        std::thread::sleep(Duration::from_millis(150));
+        let client = Conn::connect(&client_cfg).expect("client connect");
+        let server = sh.join().unwrap();
+        assert!(client.is_ready(), "client should be negotiated after handshake");
+
+        // Drop the peer entirely so the client's writes hit a reset/broken pipe.
+        server.close();
+        drop(server);
+
+        let mut errored = false;
+        for _ in 0..2000 {
+            if client.write(&frame(0x111)).is_err() {
+                errored = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(errored, "write to a dropped peer never errored");
+        assert!(!client.is_ready(), "a failed TCP write must clear negotiated/is_ready");
+    }
+
+    #[test]
+    fn handshake_rejects_wrong_banner() {
+        // The peer reads our CANNELLONIv1 then replies with 12 WRONG bytes: the
+        // handshake must reject it as InvalidData, not accept a non-cannelloni peer.
+        let (peer, conn_side) = loopback_tcp_pair();
+        let ph = std::thread::spawn(move || {
+            let mut p = peer;
+            let mut buf = [0u8; 12];
+            let _ = p.read_exact(&mut buf); // consume our banner
+            let _ = p.write_all(b"NOTCANNELLON"); // 12 bytes, wrong
+        });
+        let err = handshake(&conn_side, Duration::from_millis(500)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let _ = ph.join();
+    }
+
+    #[test]
+    fn accept_with_timeout_returns_allowed_peer() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let ch = std::thread::spawn(move || {
+            let _c = TcpStream::connect(addr).unwrap();
+            std::thread::sleep(Duration::from_millis(200)); // hold it open past accept
+        });
+        let allow = vec![loopback_v4()];
+        let (s, peer) =
+            accept_with_timeout(&l, Duration::from_secs(2), &allow, true).expect("accept allowed");
+        assert_eq!(peer.ip(), loopback_v4());
+        drop(s);
+        ch.join().unwrap();
+    }
+
+    #[test]
+    fn accept_with_timeout_rejects_disallowed_then_times_out() {
+        // A connection from a non-allowed source is shut down and the wait
+        // continues; with no allowed client it ends in TimedOut. Without the
+        // peer-IP gate (kvasilloni-872) the loopback connect would instead be
+        // RETURNED (Ok), so the TimedOut assertion is attributable to the filter.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let got_closed = Arc::new(AtomicBool::new(false));
+        let gc = got_closed.clone();
+        let ch = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            let mut b = [0u8; 1];
+            match c.read(&mut b) {
+                Ok(0) | Err(_) => gc.store(true, Ordering::SeqCst), // server shut us down
+                Ok(_) => {}
+            }
+        });
+        let allow = vec![IpAddr::V4(Ipv4Addr::new(10, 255, 255, 254))]; // loopback NOT allowed
+        let err = accept_with_timeout(&l, Duration::from_millis(700), &allow, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        ch.join().unwrap();
+        assert!(got_closed.load(Ordering::SeqCst), "disallowed client was not shut down");
+    }
+
+    #[test]
+    fn accept_with_timeout_times_out_without_client() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let allow = vec![loopback_v4()];
+        let err = accept_with_timeout(&l, Duration::from_millis(300), &allow, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn bind_udp_falls_back_to_ephemeral_when_busy() {
+        // kvasilloni-iai: a busy local port with fallback on must yield a different,
+        // non-zero ephemeral port rather than failing the bind.
+        let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let s = bind_udp(addr, true).expect("fallback bind must succeed");
+        let got = s.local_addr().unwrap();
+        assert_ne!(got.port(), 0, "fallback bound port 0");
+        assert_ne!(got.port(), addr.port(), "did not fall back off the busy port");
     }
 }
