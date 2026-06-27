@@ -98,6 +98,29 @@ struct Notify {
     tag: usize,
 }
 
+// While this thread is inside a notify callback, a re-entrant `canSetNotify`
+// (the callback re-arming or disarming itself) skips the drain in `set_notify`
+// instead of deadlocking on `cb_active`, which the same thread already holds.
+// The new callback then takes effect on the next event. See kvasilloni-4vc.
+thread_local! {
+    static IN_NOTIFY_CB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII marker for "this thread is currently executing a notify callback".
+/// Resets the flag even if the callback unwinds.
+struct CbScope;
+impl CbScope {
+    fn enter() -> Self {
+        IN_NOTIFY_CB.with(|f| f.set(true));
+        CbScope
+    }
+}
+impl Drop for CbScope {
+    fn drop(&mut self) {
+        IN_NOTIFY_CB.with(|f| f.set(false));
+    }
+}
+
 /// State shared between the RX thread (producer) and the API (consumer): the
 /// bounded ring plus a condvar for blocking reads, acceptance filters, and the
 /// optional notify callback.
@@ -113,6 +136,12 @@ pub struct Shared {
     overflow: AtomicBool,
     filters: Mutex<Accept>,
     notify: Mutex<Notify>,
+    /// Held by the RX thread across reading *and* invoking the notify callback.
+    /// `set_notify` (canSetNotify disarm/replace from another thread) drains this
+    /// after swapping the stored callback, so once it returns the old callback is
+    /// no longer running and the app may free its context without a use-after-free
+    /// (kvasilloni-4vc).
+    cb_active: Mutex<()>,
 }
 
 impl Shared {
@@ -124,6 +153,7 @@ impl Shared {
             overflow: AtomicBool::new(false),
             filters: Mutex::new(Accept::default()),
             notify: Mutex::new(Notify::default()),
+            cb_active: Mutex::new(()),
         })
     }
 
@@ -145,10 +175,20 @@ impl Shared {
             q.push_back(f);
         }
         self.cv.notify_one();
+        // Hold cb_active across BOTH the read of the callback and its invocation.
+        // A concurrent canSetNotify disarm/replace drains cb_active *after*
+        // swapping the stored callback, so either it waits for this call to finish
+        // or we observe the new (e.g. disarmed) value here - never calling a stale
+        // callback after canSetNotify returned and the app freed its context
+        // (kvasilloni-4vc). cb_active is taken before the notify lock; set_notify
+        // releases the notify lock before draining, so the two never deadlock.
+        let _active = self.cb_active.lock().unwrap_or_else(|e| e.into_inner());
         let n = *self.notify.lock().unwrap_or_else(|e| e.into_inner());
         if n.cb != 0 && n.flags & NOTIFY_RX != 0 {
+            let _scope = CbScope::enter(); // re-entrant canSetNotify skips the drain
             // SAFETY: cb is the function pointer the app passed to canSetNotify;
-            // the app contracts to keep it valid until canClose / canSetNotify(NULL).
+            // the app contracts to keep it valid until canClose / canSetNotify(NULL),
+            // and the cb_active drain makes that disarm boundary race-free.
             unsafe {
                 let cb: extern "system" fn(*mut NotifyData) = std::mem::transmute(n.cb);
                 let mut d = NotifyData {
@@ -237,8 +277,18 @@ impl Shared {
     }
 
     /// Arm/replace the notify callback (backs `canSetNotify`; cb==0 disarms).
+    ///
+    /// After swapping the stored callback, drain `cb_active` so that once this
+    /// returns the *previous* callback is no longer executing - the app may then
+    /// free the callback's context without a use-after-free (kvasilloni-4vc). The
+    /// drain is skipped when called from within a callback on the RX thread (the
+    /// callback re-arming itself): that thread already holds `cb_active`, so
+    /// draining would self-deadlock; the new callback applies to the next event.
     pub fn set_notify(&self, cb: usize, flags: u32, tag: usize) {
         *self.notify.lock().unwrap_or_else(|e| e.into_inner()) = Notify { cb, flags, tag };
+        if !IN_NOTIFY_CB.with(|f| f.get()) {
+            let _drain = self.cb_active.lock().unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 
@@ -889,6 +939,52 @@ mod tests {
         s.set_notify(test_cb as *const () as usize, 0 /* no NOTIFY_RX */, 0);
         s.push(frame(0x111));
         assert_eq!(NOTIFY_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn set_notify_reentrant_does_not_deadlock() {
+        // kvasilloni-4vc: a callback that re-arms/disarms itself runs set_notify
+        // on the RX thread while it already holds cb_active. set_notify must skip
+        // the drain in that case rather than self-deadlock.
+        let s = Shared::new();
+        IN_NOTIFY_CB.with(|f| f.set(true)); // simulate "inside a callback on this thread"
+        s.set_notify(0, 0, 0); // would block forever on cb_active without the skip
+        IN_NOTIFY_CB.with(|f| f.set(false));
+        // and a normal (non-reentrant) call still works
+        s.set_notify(0, 0, 0);
+    }
+
+    static SLOW_CB_STARTED: AtomicBool = AtomicBool::new(false);
+    static SLOW_CB_FINISHED: AtomicBool = AtomicBool::new(false);
+
+    extern "system" fn slow_cb(_d: *mut NotifyData) {
+        SLOW_CB_STARTED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        SLOW_CB_FINISHED.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn set_notify_disarm_drains_inflight_callback() {
+        // kvasilloni-4vc: disarming from another thread must not return while the
+        // previous callback is still executing - otherwise the app could free the
+        // callback's context mid-call (use-after-free). Prove the disarm blocks
+        // until the in-flight callback completes.
+        let s = Shared::new();
+        SLOW_CB_STARTED.store(false, Ordering::SeqCst);
+        SLOW_CB_FINISHED.store(false, Ordering::SeqCst);
+        s.set_notify(slow_cb as *const () as usize, NOTIFY_RX, 0);
+
+        let s2 = s.clone();
+        let t = std::thread::spawn(move || s2.push(frame(0x123))); // runs slow_cb here
+        while !SLOW_CB_STARTED.load(Ordering::SeqCst) {
+            std::thread::yield_now(); // wait until the callback is in flight
+        }
+        s.set_notify(0, 0, 0); // disarm from this thread: must wait for the drain
+        assert!(
+            SLOW_CB_FINISHED.load(Ordering::SeqCst),
+            "disarm returned while the callback was still running (UAF window)"
+        );
+        t.join().unwrap();
     }
 
     #[test]
