@@ -27,6 +27,13 @@ proto = udp
 ; cannelloni -C c). Ignored for udp.
 tcprole = client
 
+; TCP timeouts in milliseconds. canOpenChannel blocks the calling thread for up
+; to these during setup. connecttimeout bounds the client connect + handshake
+; (and also per-frame writes); accepttimeout bounds how long a server waits for a
+; client. Defaults shown.
+; connecttimeout = 5000
+; accepttimeout = 30000
+
 ; Peer restriction (like cannelloni's -R / -p). With peercheck on (default) the
 ; shim accepts inbound traffic only from `host`. Set off to accept any source.
 ; In TCP-server mode, set `host` to the IP cannelloni connects FROM.
@@ -37,6 +44,10 @@ tcprole = client
 ; open. CAUTION: a stock cannelloni replies only to its fixed -r port, so an
 ; ephemeral bind is TX-only (no RX). Leave off unless you accept that.
 ; udpportfallback = off
+
+; Number of channels advertised by canGetNumberOfChannels. Only relevant when
+; retargeting the shim to an app that enumerates channels. Default 1.
+; channels = 1
 
 ; Optional debug log. Leave empty/omit to disable.
 ; log = C:\temp\kvasilloni.log
