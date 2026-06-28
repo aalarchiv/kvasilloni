@@ -9,3 +9,7 @@ refs/
 
 # Rust / cargo build output
 /target/
+
+# proptest failure-seed cache (kvasilloni-lw6). Re-derived on demand; a genuine
+# regression surfaces in the test output regardless, so we keep it out of the tree.
+proptest-regressions/

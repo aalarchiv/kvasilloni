@@ -19,3 +19,10 @@ codegen-units = 1
 strip = true
 # Keep default unwinding: each exported fn wraps its body in catch_unwind so a
 # stray panic becomes a CANlib error code instead of crossing the FFI boundary.
+
+# Test-only. proptest drives the property suites for the untrusted wire codec
+# (wire.rs) and the layered config parser (config.rs). It is a dev-dependency, so
+# it is compiled only for `cargo test` on the host and never linked into the
+# shipped canlib32.dll - the release cdylib stays std-only. See epic kvasilloni-lw6.
+[dev-dependencies]
+proptest = "1"

@@ -711,4 +711,186 @@ mod tests {
         assert_eq!(id, 0x123);
         assert!(fl & CAN_MSG_STD != 0);
     }
+
+    // ======================= property tests (kvasilloni-lw6.1) =======================
+    //
+    // APPROACH: `proptest` (dev-dependency only - never linked into the shipped DLL).
+    // The point tests above pin the known malformed cases from kkt/nmt/56p/f1b; these
+    // properties prove the invariants hold across the whole input space:
+    //   1. round-trip identity for arbitrary VALID frames (classic / FD / RTR, every
+    //      id and every in-class length) through BOTH codecs;
+    //   2. never-panic / no-OOB for ARBITRARY bytes fed to parse_udp and to the
+    //      decode_stream state machine (catch_unwind asserts no unwind; the debug
+    //      bounds checks active under `cargo test` assert no out-of-bounds index);
+    //   3. the length-class invariant - no frame with len>8 (classic) or len>64 (FD)
+    //      ever ESCAPES a decoder;
+    //   4. the udp_prealloc_cap clamp bound.
+    // Reverting either length guard in wire.rs is caught here: a dropped FD guard makes
+    // a 65..127-byte frame overrun Frame.data -> property 2 catches the panic; a dropped
+    // classic guard lets a 9..64-byte non-FD frame escape -> property 3 catches it.
+    use proptest::prelude::*;
+
+    /// Strategy for an arbitrary VALID frame: any can_id (RTR bit forced per `rtr`
+    /// so RTR and non-RTR are both covered), classic or FD, a length within that
+    /// class's limit, valid fd_flags (FD only), and matching random data.
+    fn arb_frame() -> impl Strategy<Value = Frame> {
+        (any::<u32>(), any::<bool>(), any::<bool>(), any::<u8>(), prop::collection::vec(any::<u8>(), 0..=64))
+            .prop_map(|(id, fd, rtr, raw_flags, mut data)| {
+                let max = if fd { MAX_FRAME_LEN } else { CLASSIC_FRAME_MAX_LEN };
+                data.truncate(max);
+                let mut can_id = id;
+                if rtr {
+                    can_id |= CAN_RTR_FLAG;
+                } else {
+                    can_id &= !CAN_RTR_FLAG;
+                }
+                let mut f = Frame::default();
+                f.can_id = can_id;
+                f.fd = fd;
+                // fd_flags only travel on FD frames; a classic frame has no flags byte.
+                f.fd_flags = if fd { raw_flags & (CANFD_BRS | CANFD_ESI) } else { 0 };
+                f.len = data.len() as u8;
+                f.data[..data.len()].copy_from_slice(&data);
+                f
+            })
+    }
+
+    /// Frames are equal after a round-trip when id/fd/len/fd_flags match and, for a
+    /// non-RTR frame, the data does too. RTR carries a DLC but no data bytes, so a
+    /// decoded RTR frame's data is all-zero by construction - excluded from compare.
+    fn frame_eq(a: &Frame, b: &Frame) -> bool {
+        a.can_id == b.can_id
+            && a.fd == b.fd
+            && a.len == b.len
+            && a.fd_flags == b.fd_flags
+            && (a.is_rtr() || a.data[..a.len as usize] == b.data[..b.len as usize])
+    }
+
+    /// Drive the streaming decoder over `buf` exactly as the TCP RX loop does -
+    /// feeding precisely the requested number of bytes each step - decoding as many
+    /// back-to-back frames as the buffer holds. Returns the decoded frames; stops on
+    /// the first Error or when the buffer cannot satisfy the next read. Never reads
+    /// past `buf`. Used to fuzz the state machine with arbitrary bytes.
+    fn drive_decode_stream(buf: &[u8]) -> Vec<Frame> {
+        let mut out = Vec::new();
+        let mut f = Frame::default();
+        let mut st = DecodeState::Init;
+        let mut off = 0usize;
+        loop {
+            // (re)start a frame: Init consumes nothing and asks for the 4 id bytes.
+            let mut need = match decode_stream(&[], &mut f, &mut st) {
+                Decoded::Need(n) => n,
+                _ => break,
+            };
+            loop {
+                if off + need > buf.len() {
+                    return out; // not enough bytes left to satisfy the next read
+                }
+                let chunk = &buf[off..off + need];
+                off += need;
+                match decode_stream(chunk, &mut f, &mut st) {
+                    Decoded::Need(n) => need = n,
+                    Decoded::Complete => {
+                        out.push(f);
+                        break; // st is back at Init; outer loop starts the next frame
+                    }
+                    Decoded::Error => return out,
+                }
+            }
+        }
+        out
+    }
+
+    /// Inputs for the parse_udp never-panic property. Two gates make naive random
+    /// bytes useless here: (a) the `ver==2 && op==DATA` header is 1/65536, and (b)
+    /// parse_udp is all-or-nothing - an attacker-huge `count` exhausts the buffer and
+    /// returns None, discarding (hence hiding from the length-class check) any frame
+    /// that escaped mid-loop. So we weight toward a VALID header with a SMALL count
+    /// that the body can satisfy (datagram parses to Some, so escaped frames are
+    /// actually inspected), keep a huge-count variant (over-claim / mid-loop overrun
+    /// path), and keep fully-arbitrary bytes (header-rejection / truncation).
+    fn arb_udp_input() -> impl Strategy<Value = Vec<u8>> {
+        fn hdr(seq: u8, count: u16, body: Vec<u8>) -> Vec<u8> {
+            let mut v = vec![FRAME_VERSION, OP_DATA, seq];
+            v.extend_from_slice(&count.to_be_bytes());
+            v.extend_from_slice(&body);
+            v
+        }
+        prop_oneof![
+            4 => (any::<u8>(), 1u16..=6, prop::collection::vec(any::<u8>(), 0..=600))
+                .prop_map(|(s, c, b)| hdr(s, c, b)),
+            2 => (any::<u8>(), any::<u16>(), prop::collection::vec(any::<u8>(), 0..=600))
+                .prop_map(|(s, c, b)| hdr(s, c, b)),
+            1 => prop::collection::vec(any::<u8>(), 0..=2048),
+        ]
+    }
+
+    fn assert_len_class(f: &Frame) -> Result<(), TestCaseError> {
+        if f.fd {
+            prop_assert!(f.len as usize <= MAX_FRAME_LEN, "FD frame len {} > {}", f.len, MAX_FRAME_LEN);
+        } else {
+            prop_assert!(
+                f.len as usize <= CLASSIC_FRAME_MAX_LEN,
+                "classic frame len {} > {}",
+                f.len,
+                CLASSIC_FRAME_MAX_LEN
+            );
+        }
+        Ok(())
+    }
+
+    proptest! {
+        /// Property 1a: encode_frame -> decode_stream is identity for any valid frame.
+        #[test]
+        fn prop_tcp_roundtrip(f in arb_frame()) {
+            let got = stream_roundtrip(&f);
+            prop_assert!(frame_eq(&f, &got), "tcp round-trip mismatch: {:?} != {:?}", f, got);
+            assert_len_class(&got)?;
+        }
+
+        /// Property 1b: build_udp -> parse_udp is identity for any valid frame.
+        #[test]
+        fn prop_udp_roundtrip(f in arb_frame(), seq in any::<u8>()) {
+            let pkt = build_udp(&f, seq);
+            let got = parse_udp(&pkt).expect("a valid frame must parse");
+            prop_assert_eq!(got.len(), 1);
+            prop_assert!(frame_eq(&f, &got[0]), "udp round-trip mismatch: {:?} != {:?}", f, got[0]);
+            assert_len_class(&got[0])?;
+        }
+
+        /// Property 2a + 3: parse_udp never panics / never over-reads on ARBITRARY
+        /// bytes, and every frame it returns obeys the length-class limit.
+        #[test]
+        fn prop_parse_udp_never_panics(buf in arb_udp_input()) {
+            let res = std::panic::catch_unwind(|| parse_udp(&buf));
+            prop_assert!(res.is_ok(), "parse_udp panicked on {:?}", buf);
+            if let Ok(Some(frames)) = res {
+                for fr in &frames {
+                    assert_len_class(fr)?;
+                }
+            }
+        }
+
+        /// Property 2b + 3: the decode_stream state machine never panics / never
+        /// over-reads on ARBITRARY bytes, and every frame it yields obeys the limit.
+        #[test]
+        fn prop_decode_stream_never_panics(buf in prop::collection::vec(any::<u8>(), 0..=2048)) {
+            let res = std::panic::catch_unwind(|| drive_decode_stream(&buf));
+            prop_assert!(res.is_ok(), "decode_stream panicked on {:?}", buf);
+            if let Ok(frames) = res {
+                for fr in &frames {
+                    assert_len_class(fr)?;
+                }
+            }
+        }
+
+        /// Property 4: the pre-allocation hint is always clamped to what the datagram
+        /// could physically hold, never the attacker-controlled count (kvasilloni-56p).
+        #[test]
+        fn prop_udp_prealloc_cap_bounded(count in any::<u16>(), buf_len in 0usize..=1_000_000) {
+            let cap = udp_prealloc_cap(count, buf_len);
+            prop_assert!(cap <= buf_len / FRAME_BASE_SIZE + 1);
+            prop_assert!(cap <= count as usize);
+        }
+    }
 }
