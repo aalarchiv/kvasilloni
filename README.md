@@ -116,7 +116,7 @@ without reopening the channel. A dropped link is observable: `canReadStatus` set
 > changed: `peercheck` is now on, CAN FD receive needs `canOPEN_CAN_FD`, and a
 > busy UDP `localport` now fails the open (set `udpportfallback = on` for the old
 > behavior). `tools/ini_merge.py old.ini -o kvasilloni.ini` (needs Python 3)
-> migrates a config into the commented 0.3.0 template.
+> migrates a config into the commented 0.3.1 template.
 
 ## License
 
