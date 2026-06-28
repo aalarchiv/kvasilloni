@@ -4,6 +4,7 @@
 #   make dll32      build only the 32-bit DLL
 #   make dll64      build only the 64-bit DLL
 #   make test       run host unit tests (wire codec, golden vectors)
+#   make race       race-detect the transport concurrency under ThreadSanitizer
 #   make verify     confirm the exports are present and undecorated (32-bit)
 #   make selftest   end-to-end over vcan1 + cannelloni + wine (32-bit DLL)
 #   make selftest64 same end-to-end suite against the 64-bit DLL (wine wow64)
@@ -23,7 +24,7 @@ EXPORTS := canInitializeLibrary canOpenChannel canSetBusParams canBusOn canBusOf
            canIoCtl canAccept canObjBufSetFilter \
            canGetNumberOfChannels canGetChannelData canSetNotify
 
-.PHONY: all dll32 dll64 test verify selftest selftest64 clean
+.PHONY: all dll32 dll64 test race verify selftest selftest64 clean
 
 all: dll32 dll64
 
@@ -37,6 +38,16 @@ dll64:
 
 test:
 	cargo test
+
+# Race-detect the transport concurrency (Shared ring + Conn teardown) under
+# ThreadSanitizer. -Z build-std rebuilds std with TSan instrumentation so its
+# Mutex/Condvar are seen too; halt_on_error makes any data race a hard failure.
+# Needs the nightly toolchain + rust-src. See kvasilloni-lw6.3 and the
+# race-detection test block in src/transport.rs.
+race:
+	rustup component add rust-src --toolchain nightly
+	TSAN_OPTIONS="halt_on_error=1" RUSTFLAGS="-Zsanitizer=thread" \
+	    cargo +nightly test -Z build-std --target x86_64-unknown-linux-gnu --lib transport::
 
 verify: dll32
 	@echo "== 32-bit exports =="

@@ -1341,4 +1341,203 @@ mod tests {
         assert_ne!(got.port(), 0, "fallback bound port 0");
         assert_ne!(got.port(), addr.port(), "did not fall back off the busy port");
     }
+
+    // ===================== race-detection tests (kvasilloni-lw6.3) =====================
+    //
+    // METHOD: ThreadSanitizer. The whole transport module - the existing concurrency
+    // tests (disarm-drains-inflight 4vc, reentrant-no-deadlock 4vc, mark_closed-wakes
+    // hc9, write-teardown lo7) plus the three below - runs race-clean under:
+    //
+    //   rustup component add rust-src --toolchain nightly   # once
+    //   RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -Z build-std \
+    //       --target x86_64-unknown-linux-gnu --lib transport::
+    //
+    // (`-Z build-std` rebuilds std with TSan instrumentation so its Mutex/Condvar are
+    // seen too.) loom was rejected: it would require swapping std sync primitives for
+    // loom's behind cfg(loom) in production code and cannot model the real
+    // JoinHandle/thread::current().id() close() self-join logic (cqe).
+    //
+    // The three scenarios the epic calls out:
+    //   (a) 4vc - push() firing the callback while another thread disarms: the
+    //       cb_active drain must order the app-context access -> cb_active_drain_*.
+    //   (b) cqe - a callback that calls close() ON the RX thread: detach, never
+    //       self-join -> close_from_notify_callback_detaches_*.
+    //   (c) hc9 - readers blocked in pop_wait/peek_wait woken by mark_closed: covered
+    //       by mark_closed_wakes_* above and stressed under contention below.
+    //
+    // VERIFIED that TSan (the chosen method) detects a removed drain: deleting the
+    // `cb_active` drain in set_notify makes cb_active_drain_orders_app_context_access
+    // report a data race under TSan (and the existing logical assertion in
+    // set_notify_disarm_drains_inflight_callback fails even without TSan).
+    //
+    // shared_concurrent_stress_is_race_clean also stands alone as the documented
+    // heavier std-thread stress regime for hosts without a TSan-capable nightly: it
+    // is probabilistic there, a proof only under TSan.
+
+    /// `*mut u64` standing in for the app's callback context; the callback READS it
+    /// on the RX thread, the disarming thread WRITES (frees) it after the drain.
+    static CTX_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static CTX_CB_ENTERED: AtomicBool = AtomicBool::new(false);
+
+    extern "system" fn cb_reads_context(_d: *mut NotifyData) {
+        let p = CTX_PTR.load(Ordering::SeqCst) as *const u64;
+        if !p.is_null() {
+            CTX_CB_ENTERED.store(true, Ordering::SeqCst);
+            // Widen the window so a disarm that does NOT drain reliably overlaps this
+            // non-atomic read (which is what TSan would then flag).
+            std::thread::sleep(Duration::from_millis(60));
+            // SAFETY: the test keeps the pointee alive until it has observed the drain.
+            let _v = unsafe { std::ptr::read_volatile(p) };
+        }
+    }
+
+    #[test]
+    fn cb_active_drain_orders_app_context_access() {
+        // kvasilloni-4vc, TSan target. push() holds cb_active across reading AND
+        // invoking the callback; set_notify drains cb_active after swapping the
+        // callback. So a disarm from another thread happens-AFTER any in-flight
+        // callback's access to the app context. Here the callback does a NON-atomic
+        // read of a heap "context"; once the disarm returns we do a NON-atomic write
+        // (modelling the app freeing it). With the drain, write happens-after read:
+        // race-free. Drop the drain and TSan reports a data race on the context.
+        let s = Shared::new();
+        let mut ctx = Box::new(0xAAAA_u64);
+        let ptr = &mut *ctx as *mut u64;
+        CTX_PTR.store(ptr as usize, Ordering::SeqCst);
+        CTX_CB_ENTERED.store(false, Ordering::SeqCst);
+        s.set_notify(cb_reads_context as *const () as usize, NOTIFY_RX, 0);
+
+        let s2 = s.clone();
+        let t = std::thread::spawn(move || s2.push(frame(0x123))); // callback reads ctx here
+        while !CTX_CB_ENTERED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        s.set_notify(0, 0, 0); // disarm: blocks on the drain until the read is done
+        // Safe now (post-drain): write the "context". Races with the read iff the
+        // drain was removed.
+        unsafe { std::ptr::write_volatile(ptr, 0xBBBB_u64) };
+        t.join().unwrap();
+        CTX_PTR.store(0, Ordering::SeqCst);
+        assert_eq!(*ctx, 0xBBBB);
+    }
+
+    static CQE_CONN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static CQE_CLOSED: AtomicBool = AtomicBool::new(false);
+
+    extern "system" fn cb_closes_conn(_d: *mut NotifyData) {
+        let p = CQE_CONN.load(Ordering::SeqCst);
+        if p != 0 {
+            // SAFETY: the test keeps the Conn alive (and pins it) until it observes
+            // CQE_CLOSED, then clears this pointer.
+            let c = unsafe { &*(p as *const Conn) };
+            c.close(); // runs ON the RX thread -> must detach, not self-join (cqe)
+            CQE_CLOSED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn close_from_notify_callback_detaches_not_self_joins() {
+        // kvasilloni-cqe: a canSetNotify callback fires on the RX thread; if the app
+        // calls canClose from it, Conn::close() runs on the RX thread and must DETACH
+        // it (h.thread().id() == current id) rather than join, which would deadlock
+        // the thread on itself. Drive the real path: a loopback datagram makes the RX
+        // thread fire the callback, which closes the Conn from within. Proof = close()
+        // completing (CQE_CLOSED) well within the timeout instead of hanging.
+        let conn = Conn::connect(&udp_cfg(0, 0)).expect("udp connect");
+        let port = conn.local_port();
+        CQE_CLOSED.store(false, Ordering::SeqCst);
+        CQE_CONN.store(&conn as *const Conn as usize, Ordering::SeqCst);
+        conn.set_notify(cb_closes_conn as *const () as usize, NOTIFY_RX, 0);
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // A couple of datagrams in case the first races the loop's first recv.
+        for _ in 0..3 {
+            let _ = sender.send_to(&wire::build_udp(&frame(0x123), 0), ("127.0.0.1", port));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let start = Instant::now();
+        while !CQE_CLOSED.load(Ordering::SeqCst) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "close() from the RX-thread callback never completed (self-join deadlock?)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        CQE_CONN.store(0, Ordering::SeqCst); // unpark before conn drops
+        std::thread::sleep(Duration::from_millis(50)); // let the detached RX thread unwind
+        // conn's Drop calls close() again; the handle was already taken -> no double join.
+    }
+
+    extern "system" fn cb_noop(_d: *mut NotifyData) {}
+
+    #[test]
+    fn shared_concurrent_stress_is_race_clean() {
+        // High-contention stand-in: many producers (push) + a notify churner
+        // (arm/disarm, exercising the cb_active drain against concurrent push, 4vc)
+        // + blocking readers (pop_wait/peek_wait woken by mark_closed, hc9). Bounded
+        // so a plain `cargo test` run stays fast; run under TSan for a race proof,
+        // where the dense interleavings are what the sanitizer inspects.
+        let s = Shared::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        for p in 0..4u32 {
+            let s = s.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..1000u32 {
+                    s.push(frame(0x100 + (p << 8) + (i & 0xFF)));
+                }
+            }));
+        }
+        // Notify churner: repeatedly arm/disarm so set_notify's drain races push()'s
+        // cb_active + callback invocation. cb_noop touches no shared state, so it
+        // cannot bleed into the other notify tests (cf. kvasilloni-im6.1).
+        {
+            let s = s.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    s.set_notify(cb_noop as *const () as usize, NOTIFY_RX, 0);
+                    s.set_notify(0, 0, 0);
+                }
+            }));
+        }
+        // Blocking readers + peekers; mark_closed (and `stop`) release them.
+        for _ in 0..3 {
+            let (s, stop) = (s.clone(), stop.clone());
+            handles.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = s.pop_wait(Duration::from_millis(20));
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let (s, stop) = (s.clone(), stop.clone());
+            handles.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = s.peek_wait(Duration::from_millis(20));
+                }
+            }));
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+        s.mark_closed(); // hc9: wake every currently-blocked reader at once
+        stop.store(true, Ordering::SeqCst);
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    /// A loopback UDP Config (local ephemeral via cfg!(test) fallback). peer_check
+    /// off so a loopback sender is always allowed.
+    fn udp_cfg(remote: u16, local: u16) -> Config {
+        Config {
+            host: "127.0.0.1".into(),
+            remote_port: remote,
+            local_port: local,
+            tcp: false,
+            peer_check: false,
+            ..Config::default()
+        }
+    }
 }
