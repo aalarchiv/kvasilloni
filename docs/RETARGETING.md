@@ -59,4 +59,5 @@ load that app.
 **Before pointing kvasilloni at a different application, run the import-coverage
 check** - the step-by-step procedure (enumerate the app's canlib imports, diff
 against `make verify`, implement any missing symbols, then update the tables
-above) lives in [`AGENTS.md`](../AGENTS.md).
+above) lives in
+[`AGENTS.md`](https://github.com/aalarchiv/kvasilloni/blob/main/AGENTS.md).
