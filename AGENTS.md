@@ -29,8 +29,8 @@
 >    make verify   # lists the 13 exported names
 >    ```
 > 3. For each missing symbol, implement it in `src/lib.rs` (+ add to the
->    coverage/selftest) before declaring the new app supported. Update the README
->    "Scope" section with the new export set.
+>    coverage/selftest) before declaring the new app supported. Update the export
+>    tables in `docs/RETARGETING.md` with the new export set.
 >
 > See `bd memories canlib` for the recorded rationale.
 

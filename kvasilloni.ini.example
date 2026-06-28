@@ -24,7 +24,9 @@ localport = 20000
 proto = udp
 
 ; TCP only: client (shim dials cannelloni -C s) or server (shim accepts
-; cannelloni -C c). Ignored for udp.
+; cannelloni -C c). Ignored for udp. As server the shim is a one-to-one tunnel:
+; it accepts a single client (the first allowed connection), then stops listening
+; (one client per channel; a dropped client cannot reconnect without a reopen).
 tcprole = client
 
 ; TCP timeouts in milliseconds. canOpenChannel blocks the calling thread for up
