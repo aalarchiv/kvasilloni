@@ -36,6 +36,11 @@
  *       canRead, printing each RX. Proves a real >8-byte FD frame on the wire is
  *       capped to <=8 bytes and reported classic, so a classic app's 8-byte
  *       buffer is never overrun (kvasilloni-nmt / -im6.4).
+ *   canshim_probe.exe --server-drop
+ *       TCP-server role (from env). Confirm the link is up by receiving a frame,
+ *       then - after the harness kills the cannelloni client - assert that a
+ *       read-only consumer sees canReadStatus report canSTAT_BUS_OFF rather than
+ *       a silently quiet bus (kvasilloni-5gh).
  */
 #include <windows.h>
 #include <stdio.h>
@@ -56,6 +61,7 @@
 #define canFILTER_SET_MASK_EXT 6
 #define canCHANNELDATA_CHANNEL_NAME 13
 #define canNOTIFY_RX 0x0001
+#define canSTAT_BUS_OFF 0x00000002  /* canReadStatus: transport link is down */
 
 typedef void (__stdcall *fn_init)(void);
 typedef int  (__stdcall *fn_open)(int, int);
@@ -68,6 +74,7 @@ typedef int  (__stdcall *fn_numchan)(int*);
 typedef int  (__stdcall *fn_chandata)(int, int, void*, size_t);
 typedef int  (__stdcall *fn_accept)(int, long, unsigned);
 typedef int  (__stdcall *fn_setnotify)(int, void*, unsigned, void*);
+typedef int  (__stdcall *fn_readstatus)(int, unsigned long*);
 
 /* canNotifyData: only the RX-relevant prefix matters here (see canlib.h). */
 typedef struct { void *tag; int eventType; long id; unsigned long time; } notify_data;
@@ -87,6 +94,7 @@ static int run_timed_open(HMODULE dll);
 static int run_multi_rx(HMODULE dll, int argc, char **argv);
 static int run_stress(HMODULE dll, int argc, char **argv);
 static int run_classic_rx(HMODULE dll, int argc, char **argv);
+static int run_server_drop(HMODULE dll);
 
 int main(int argc, char **argv)
 {
@@ -124,6 +132,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--multi-rx")) return run_multi_rx(dll, argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--stress"))  return run_stress(dll, argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--classic-rx")) return run_classic_rx(dll, argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "--server-drop")) return run_server_drop(dll);
 
 #define GET(v, t, n) v = (t)GetProcAddress(dll, n); \
     if (!v) { fprintf(stderr, "PROBE: missing export %s\n", n); return 2; }
@@ -186,6 +195,57 @@ static int run_enum(HMODULE dll)
     st = p_chandata(0, canCHANNELDATA_CHANNEL_NAME, name, sizeof name);
     printf("PROBE: ENUM name=\"%s\" st=%d\n", name, st);
     fflush(stdout);
+    FreeLibrary(dll);
+    return 0;
+}
+
+/* --server-drop: TCP-server channel (transport from env). Phase 1 confirms the
+ * link is up by receiving the harness-injected frame; phase 2 polls canReadStatus
+ * after the cannelloni client is killed and reports whether canSTAT_BUS_OFF
+ * surfaced - i.e. whether a read-only consumer can tell the link died instead of
+ * sitting on a silently quiet bus (kvasilloni-5gh). */
+static int run_server_drop(HMODULE dll)
+{
+    fn_init       p_init   = (fn_init)      GetProcAddress(dll, "canInitializeLibrary");
+    fn_open       p_open   = (fn_open)      GetProcAddress(dll, "canOpenChannel");
+    fn_setbus     p_setbus = (fn_setbus)    GetProcAddress(dll, "canSetBusParams");
+    fn_buson      p_buson  = (fn_buson)     GetProcAddress(dll, "canBusOn");
+    fn_read       p_read   = (fn_read)      GetProcAddress(dll, "canRead");
+    fn_readstatus p_status = (fn_readstatus)GetProcAddress(dll, "canReadStatus");
+    fn_close      p_close  = (fn_close)     GetProcAddress(dll, "canClose");
+    int h, loops, got_rx = 0;
+    unsigned long st = 0;
+    if (!p_open || !p_read || !p_status) { fprintf(stderr, "PROBE: server-drop exports missing\n"); return 2; }
+    if (p_init) p_init();
+    h = p_open(0, 0);  /* server role from KVASILLONI_TCPROLE; open blocks for the client */
+    if (h < 0) { fprintf(stderr, "PROBE: canOpenChannel failed %d\n", h); return 3; }
+    p_setbus(h, 250000, 0, 0, 0, 0, 0);
+    p_buson(h);
+
+    /* Phase 1: receive the injected frame, proving the link is up. ~8s budget. */
+    for (loops = 0; loops < 800 && !got_rx; loops++) {
+        long rid; unsigned rdlc, rflag; unsigned long t;
+        unsigned char rbuf[64];
+        if (p_read(h, &rid, rbuf, &rdlc, &rflag, &t) == 0) {
+            got_rx = 1;
+            printf("PROBE: RX id=0x%lX dlc=%u flag=0x%x\n", rid, rdlc, rflag);
+        } else {
+            Sleep(10);
+        }
+    }
+    printf("PROBE: link-up rx=%d\n", got_rx); fflush(stdout);
+
+    /* Phase 2: the harness kills the cannelloni client here. Poll status for ~8s;
+     * the RX loop must latch the dropped link so BUS_OFF appears to this reader. */
+    for (loops = 0; loops < 800; loops++) {
+        st = 0;
+        p_status(h, &st);
+        if (st & canSTAT_BUS_OFF) break;
+        Sleep(10);
+    }
+    printf("PROBE: BUSOFF=%d st=0x%lx\n", (st & canSTAT_BUS_OFF) ? 1 : 0, st);
+    fflush(stdout);
+    p_close(h);
     FreeLibrary(dll);
     return 0;
 }

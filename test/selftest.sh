@@ -469,6 +469,31 @@ else
 fi
 rm -f "$srv_cap" "$srv_out"
 
+# --- TCP server one-to-one: client drop surfaces BUS_OFF (kvasilloni-5gh) ---
+# In server mode the shim accepts a single client. When that client (cannelloni)
+# drops, a read-only consumer must learn the link died via canReadStatus
+# (canSTAT_BUS_OFF), not sit on a silently quiet bus.
+echo; echo "===== CASE: TCP server client-drop surfaces BUS_OFF (--server-drop) ====="
+sd_out="$(mktemp)"
+( cd "$BUILD" && KVASILLONI_PROTO=tcp KVASILLONI_TCPROLE=server KVASILLONI_LOCALPORT=20146 \
+    KVASILLONI_ACCEPT_TIMEOUT=8000 \
+    timeout 40 wine ./canshim_probe.exe --server-drop ) > "$sd_out" 2>/dev/null & SDPB=$!; PIDS+=("$SDPB")
+sleep 1.5   # let the probe bind its listener and enter accept()
+"$CANNBIN" -C c -R 127.0.0.1 -r 20146 -p -I "$VCAN" >/dev/null 2>&1 & SDCN=$!; PIDS+=("$SDCN")
+sleep 2.0   # let cannelloni connect + handshake
+cansend "$VCAN" "18FF0540#77" 2>/dev/null
+echo "  injected: 18FF0540 (to shim via cannelloni client)"
+sleep 1.5   # let the probe receive it (link up) before we drop the peer
+kill "$SDCN" 2>/dev/null   # drop the one client
+echo "  killed cannelloni client (peer drop)"
+wait "$SDPB" 2>/dev/null
+if grep -qE "PROBE: link-up rx=1" "$sd_out" && grep -qE "PROBE: BUSOFF=1" "$sd_out"; then
+  echo "  PASS: reader saw BUS_OFF after the client dropped (link-down is observable)"
+else
+  echo "  FAIL: client drop not surfaced via canReadStatus"; sed 's/^/    /' "$sd_out"; FAIL=1
+fi
+rm -f "$sd_out"
+
 # --- TCP server accept timeout with no client (kvasilloni-6ot) ---
 # A server open with no client must time out in ~accepttimeout and fail, not hang.
 echo; echo "===== CASE: TCP server accept timeout (no client) ====="

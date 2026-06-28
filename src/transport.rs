@@ -142,6 +142,12 @@ pub struct Shared {
     /// learn it fell behind via `canReadStatus` (canSTAT_SW_OVERRUN). Cleared on
     /// `clear()` (canFlushReceiveQueue). See kvasilloni-tlm.
     overflow: AtomicBool,
+    /// Latched when the RX loop tears down on an *unsolicited* peer close or
+    /// stream desync (not an intentional `close()`/write teardown). Lets a
+    /// read-only app learn the link died via `canReadStatus` (canSTAT_BUS_OFF)
+    /// instead of seeing a silently quiet bus. Terminal for this Conn - never
+    /// cleared, since recovery is a reopen onto a fresh Shared. See kvasilloni-5gh.
+    link_lost: AtomicBool,
     filters: Mutex<Accept>,
     notify: Mutex<Notify>,
     /// Held by the RX thread across reading *and* invoking the notify callback.
@@ -159,6 +165,7 @@ impl Shared {
             cv: Condvar::new(),
             closed: AtomicBool::new(false),
             overflow: AtomicBool::new(false),
+            link_lost: AtomicBool::new(false),
             filters: Mutex::new(Accept::default()),
             notify: Mutex::new(Notify::default()),
             cb_active: Mutex::new(()),
@@ -272,6 +279,17 @@ impl Shared {
     /// last `clear()` (backs canReadStatus canSTAT_SW_OVERRUN). See kvasilloni-tlm.
     pub fn overflowed(&self) -> bool {
         self.overflow.load(Ordering::SeqCst)
+    }
+
+    /// Latch that the peer dropped or the stream desynced (kvasilloni-5gh).
+    pub fn mark_link_lost(&self) {
+        self.link_lost.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the RX loop tore down on an unsolicited peer close / stream desync
+    /// (backs canReadStatus canSTAT_BUS_OFF). See kvasilloni-5gh.
+    pub fn link_lost(&self) -> bool {
+        self.link_lost.load(Ordering::SeqCst)
     }
 
     /// Apply one `canAccept` directive (canFILTER_SET_{CODE,MASK}_{STD,EXT}).
@@ -455,8 +473,8 @@ impl Conn {
         let tx_stream = stream.try_clone()?;
         let stop_stream = stream;
 
-        let (rxq, run) = (shared.clone(), running.clone());
-        let handle = std::thread::spawn(move || tcp_rx_loop(rx_stream, rxq, run));
+        let (rxq, run, neg) = (shared.clone(), running.clone(), negotiated.clone());
+        let handle = std::thread::spawn(move || tcp_rx_loop(rx_stream, rxq, run, neg));
 
         Ok(Conn {
             tx: Mutex::new(Tx::Tcp { stream: tx_stream }),
@@ -534,6 +552,12 @@ impl Conn {
     /// Whether RX frames have been dropped due to a full ring (canSTAT_SW_OVERRUN).
     pub fn rx_overflowed(&self) -> bool {
         self.shared.overflowed()
+    }
+
+    /// Whether the connection dropped on an unsolicited peer close / stream desync
+    /// (canSTAT_BUS_OFF), so a read-only app can detect the dead link (kvasilloni-5gh).
+    pub fn rx_link_lost(&self) -> bool {
+        self.shared.link_lost()
     }
 
     /// Clone of the shared RX state, so a blocking read (`canReadWait` /
@@ -731,13 +755,21 @@ fn guarded_decode_stream(chunk: &[u8], f: &mut Frame, st: &mut DecodeState) -> D
     .unwrap_or(Decoded::Error)
 }
 
-fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Shared>, running: Arc<AtomicBool>) {
+fn tcp_rx_loop(
+    mut stream: TcpStream,
+    rx: Arc<Shared>,
+    running: Arc<AtomicBool>,
+    negotiated: Arc<AtomicBool>,
+) {
     let mut f = Frame::default();
     let mut st = DecodeState::Init;
-    // prime: Init -> asks for the CAN_ID size
+    // prime: Init -> asks for the CAN_ID size. A non-Need here is a decoder
+    // invariant break, not a peer event; fall through to the teardown below
+    // (need=0 breaks the loop on its first check) rather than leaving the link
+    // looking alive.
     let mut need = match wire::decode_stream(&[], &mut f, &mut st) {
         Decoded::Need(n) => n,
-        _ => return,
+        _ => 0,
     };
     let mut chunk = [0u8; 80];
     while running.load(Ordering::SeqCst) {
@@ -763,6 +795,19 @@ fn tcp_rx_loop(mut stream: TcpStream, rx: Arc<Shared>, running: Arc<AtomicBool>)
             }
             Decoded::Error => break,
         }
+    }
+    // Reaching here with `running` still set means the loop tore *itself* down -
+    // the peer closed the socket or the stream desynced - rather than being
+    // stopped by close()/a write-error teardown, both of which clear `running`
+    // first. Surface it so a read-only consumer can tell the link died instead of
+    // sitting on a silently quiet bus: clear negotiated (is_ready -> false), latch
+    // a bus-off status for canReadStatus, and wake any blocked reader. The
+    // atomic swap makes this fire exactly once and never races a concurrent
+    // close(). (kvasilloni-5gh)
+    if running.swap(false, Ordering::SeqCst) {
+        negotiated.store(false, Ordering::SeqCst);
+        rx.mark_link_lost();
+        rx.mark_closed();
     }
 }
 
@@ -1179,8 +1224,9 @@ mod tests {
         let (mut peer, conn_side) = loopback_tcp_pair();
         let rx = Shared::new();
         let running = Arc::new(AtomicBool::new(true));
-        let (rxq, run) = (rx.clone(), running.clone());
-        let h = std::thread::spawn(move || tcp_rx_loop(conn_side, rxq, run));
+        let negotiated = Arc::new(AtomicBool::new(true));
+        let (rxq, run, neg) = (rx.clone(), running.clone(), negotiated.clone());
+        let h = std::thread::spawn(move || tcp_rx_loop(conn_side, rxq, run, neg));
 
         let mut enc = Vec::new();
         wire::encode_frame(&mut enc, &frame(0x456));
@@ -1193,11 +1239,45 @@ mod tests {
         assert_eq!(f.can_id, 0x456);
 
         // A classic frame claiming len=9 (> 8) decodes to Decoded::Error: the loop
-        // tears down the unresyncable stream and returns. join() proves it exited.
+        // tears down the unresyncable stream ON ITS OWN (no close() was called).
+        // It self-terminates - clearing running/negotiated and latching link-lost -
+        // which is exactly how an unsolicited disconnect surfaces (kvasilloni-5gh).
         peer.write_all(&[0x00, 0x00, 0x01, 0x00, 9]).unwrap();
         peer.flush().unwrap();
         h.join().unwrap();
-        assert!(running.load(Ordering::SeqCst), "loop must exit on Error, not via running=false");
+        assert!(!running.load(Ordering::SeqCst), "loop self-terminates on Error");
+        assert!(!negotiated.load(Ordering::SeqCst), "error exit clears negotiated");
+        assert!(rx.link_lost(), "error exit latches link-lost for canReadStatus");
+    }
+
+    #[test]
+    fn tcp_rx_loop_peer_drop_surfaces_link_lost() {
+        // kvasilloni-5gh: when the peer drops the connection, the RX loop must
+        // surface it - clear negotiated, latch link-lost (canSTAT_BUS_OFF), and
+        // wake a blocked reader - so a read-only app isn't stranded on a silently
+        // quiet bus with no way to tell the link died.
+        let (peer, conn_side) = loopback_tcp_pair();
+        let rx = Shared::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let negotiated = Arc::new(AtomicBool::new(true));
+        let (rxq, run, neg) = (rx.clone(), running.clone(), negotiated.clone());
+        let h = std::thread::spawn(move || tcp_rx_loop(conn_side, rxq, run, neg));
+
+        // A read-only consumer is blocked waiting for traffic that never comes.
+        let waiter_rx = rx.clone();
+        let waiter = std::thread::spawn(move || waiter_rx.pop_wait(Duration::from_secs(5)));
+
+        // The peer closes its end: the loop's read_exact fails -> unsolicited
+        // teardown (running was never cleared from the outside).
+        drop(peer);
+
+        h.join().unwrap();
+        assert!(!negotiated.load(Ordering::SeqCst), "peer drop must clear negotiated");
+        assert!(!running.load(Ordering::SeqCst), "peer drop must stop the loop");
+        assert!(rx.link_lost(), "peer drop must latch link-lost (canSTAT_BUS_OFF)");
+        // The blocked reader was woken by mark_closed: it returns promptly with no
+        // frame rather than parking for the full 5s timeout.
+        assert!(waiter.join().unwrap().is_none(), "woken reader returns None on a dead link");
     }
 
     #[test]

@@ -88,7 +88,8 @@ To run the shim as the TCP **server** instead, set `tcprole = server` (cannellon
 connects as the client, `-C c`). The server is a **one-to-one tunnel**: it accepts
 a single cannelloni client - the first allowed connection - then stops listening.
 It serves one client per channel, not many, and a dropped client cannot reconnect
-without reopening the channel.
+without reopening the channel. A dropped link is observable: `canReadStatus` sets
+`canSTAT_BUS_OFF`, so the app can detect it and reopen.
 
 ## Troubleshooting
 

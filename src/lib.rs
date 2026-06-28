@@ -61,6 +61,9 @@ const CAN_DRIVER_NORMAL: u32 = 4;
 const CAN_OPEN_CAN_FD: c_int = 0x0400;
 
 // ---- canReadStatus flag bits (canstat.h) ----
+/// `canSTAT_BUS_OFF`: the transport link is down - the TCP peer dropped or the
+/// stream desynced - so a read-only app can detect a dead link (kvasilloni-5gh).
+const CAN_STAT_BUS_OFF: c_ulong = 0x0000_0002;
 /// `canSTAT_RX_PENDING`: at least one frame is queued for reading.
 const CAN_STAT_RX_PENDING: c_ulong = 0x0000_0020;
 /// `canSTAT_SW_OVERRUN`: the driver dropped received frames (ring overflow).
@@ -406,9 +409,10 @@ fn read_wait_duration(timeout: c_ulong) -> Duration {
 #[no_mangle]
 pub extern "system" fn canReadStatus(hnd: c_int, flags: *mut c_ulong) -> c_int {
     guard(|| {
-        // Report real RX state: pending frames and a sticky software-overrun bit
-        // when the ring has dropped frames (kvasilloni-tlm). Lenient on an unknown
-        // handle - report 0 rather than INVHANDLE, matching the prior behavior.
+        // Report real RX state: pending frames, a sticky software-overrun bit when
+        // the ring has dropped frames (kvasilloni-tlm), and a bus-off bit when the
+        // transport link has dropped (kvasilloni-5gh). Lenient on an unknown handle
+        // - report 0 rather than INVHANDLE, matching the prior behavior.
         let mut st: c_ulong = 0;
         let conn = CONNS.lock().unwrap_or_else(|e| e.into_inner()).get(&hnd).cloned();
         if let Some(c) = conn {
@@ -417,6 +421,9 @@ pub extern "system" fn canReadStatus(hnd: c_int, flags: *mut c_ulong) -> c_int {
             }
             if c.rx_overflowed() {
                 st |= CAN_STAT_SW_OVERRUN;
+            }
+            if c.rx_link_lost() {
+                st |= CAN_STAT_BUS_OFF;
             }
         }
         unsafe {
@@ -1166,6 +1173,29 @@ mod tests {
         let mut bad: c_ulong = 0xDEAD;
         assert_eq!(canReadStatus(-999, &mut bad), CAN_OK);
         assert_eq!(bad, 0);
+
+        canClose(h);
+    }
+
+    #[test]
+    fn read_status_reports_bus_off_on_link_loss() {
+        // kvasilloni-5gh: when the RX loop latches an unsolicited link drop,
+        // canReadStatus surfaces canSTAT_BUS_OFF so a read-only app can tell the
+        // link died instead of polling a silently quiet bus. RX_PENDING for any
+        // frames still queued at the drop is reported alongside it.
+        let _isolation = CONNS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = open_loopback_channel();
+        let shared = conn_for(h).rx_shared();
+
+        let mut flags: c_ulong = 0;
+        canReadStatus(h, &mut flags);
+        assert_eq!(flags & CAN_STAT_BUS_OFF, 0, "no bus-off on a live link");
+
+        shared.push(rx_frame(0x321, &[0x01]));
+        shared.mark_link_lost(); // RX loop's unsolicited-disconnect teardown
+        canReadStatus(h, &mut flags);
+        assert_ne!(flags & CAN_STAT_BUS_OFF, 0, "a dropped link must set BUS_OFF");
+        assert_ne!(flags & CAN_STAT_RX_PENDING, 0, "a frame queued at the drop still reads pending");
 
         canClose(h);
     }
