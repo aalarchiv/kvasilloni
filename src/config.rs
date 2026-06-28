@@ -176,7 +176,13 @@ impl Config {
     }
 
     fn apply_env(&mut self) {
-        let e = |k: &str| std::env::var(k).ok();
+        self.apply_env_with(|k| std::env::var(k).ok());
+    }
+
+    /// The env overlay, parameterised by a lookup so it can be property-tested with
+    /// an injected map instead of mutating (and racing on) the real process env
+    /// (kvasilloni-lw6.5). Production calls it with `std::env::var`.
+    fn apply_env_with(&mut self, e: impl Fn(&str) -> Option<String>) {
         if let Some(v) = e("KVASILLONI_HOST") {
             if v.trim().is_empty() {
                 self.warnings.push("empty KVASILLONI_HOST; using default".into());
@@ -472,5 +478,226 @@ mod tests {
         let ips = parse_ip_list("not-an-ip, 192.168.0.1,,fe80::1");
         let want: Vec<IpAddr> = ["192.168.0.1", "fe80::1"].iter().map(|s| s.parse().unwrap()).collect();
         assert_eq!(ips, want);
+    }
+
+    // ======================= property tests (kvasilloni-lw6.5) =======================
+    //
+    // APPROACH: `proptest` (dev-dependency only). config.rs was outside im6's scope
+    // and feeds security-relevant settings (peer_check, allow-list). The point tests
+    // above pin known cases; these prove the parse/validation matrix across the whole
+    // value space. apply_map already takes an injected map; apply_env was refactored
+    // to apply_env_with(getter) so the env layer is tested WITHOUT mutating (racing
+    // on) the real process env.
+    use proptest::prelude::*;
+
+    const KNOWN_KEYS: &[&str] = &[
+        "host", "port", "localport", "proto", "tcprole", "log", "channels",
+        "connecttimeout", "accepttimeout", "udpportfallback", "peercheck", "allow",
+    ];
+    const ENV_KEYS: &[&str] = &[
+        "KVASILLONI_HOST", "KVASILLONI_PORT", "KVASILLONI_LOCALPORT", "KVASILLONI_PROTO",
+        "KVASILLONI_TCPROLE", "KVASILLONI_LOG", "KVASILLONI_CHANNELS",
+        "KVASILLONI_CONNECT_TIMEOUT", "KVASILLONI_ACCEPT_TIMEOUT",
+        "KVASILLONI_UDP_PORT_FALLBACK", "KVASILLONI_PEER_CHECK", "KVASILLONI_ALLOW",
+    ];
+
+    /// A config value drawn from the regions that actually stress the parsers:
+    /// numeric (incl. out-of-range / negative via i64), bool-ish words (mixed case),
+    /// IP-ish literals and junk, blanks, plus fully arbitrary text.
+    fn arb_value() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => any::<i64>().prop_map(|n| n.to_string()),
+            2 => prop::sample::select(vec![
+                "1", "0", "true", "false", "yes", "no", "on", "off", "enable", "ENABLED", "On", "OFF",
+            ]).prop_map(String::from),
+            2 => prop::sample::select(vec![
+                "127.0.0.1", "::1", "10.0.0.5", "fe80::1", "not-an-ip", "", "   ", "tcp", "udp", "server", "client",
+            ]).prop_map(String::from),
+            1 => any::<String>(),
+        ]
+    }
+
+    fn arb_key(known: &'static [&'static str]) -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => prop::sample::select(known.to_vec()).prop_map(String::from),
+            1 => any::<String>(),
+        ]
+    }
+
+    fn arb_map(known: &'static [&'static str]) -> impl Strategy<Value = HashMap<String, String>> {
+        prop::collection::vec((arb_key(known), arb_value()), 0..=16)
+            .prop_map(|kvs| kvs.into_iter().collect())
+    }
+
+    /// A token for the allow-list: a valid IP literal (with its parsed value) or junk
+    /// that must NOT parse and contains no separator char so it stays one token.
+    fn arb_ip_token() -> impl Strategy<Value = (String, Option<IpAddr>)> {
+        prop_oneof![
+            prop::sample::select(vec!["127.0.0.1", "10.0.0.5", "192.168.1.1", "::1", "fe80::1", "2001:db8::1"])
+                .prop_map(|s| (s.to_string(), Some(s.parse::<IpAddr>().unwrap()))),
+            prop::sample::select(vec!["nope", "999.999.999.999", "abc", "12345", "x", "::g"])
+                .prop_map(|s| (s.to_string(), None)),
+        ]
+    }
+
+    proptest! {
+        /// Building a Config from ANY INI map never panics.
+        #[test]
+        fn prop_apply_map_never_panics(m in arb_map(KNOWN_KEYS)) {
+            let res = std::panic::catch_unwind(|| {
+                let mut cfg = Config::default();
+                cfg.apply_map(&m);
+            });
+            prop_assert!(res.is_ok(), "apply_map panicked on {:?}", m);
+        }
+
+        /// Building a Config from ANY env map never panics (via the injected getter).
+        #[test]
+        fn prop_apply_env_never_panics(m in arb_map(ENV_KEYS)) {
+            let res = std::panic::catch_unwind(|| {
+                let mut cfg = Config::default();
+                cfg.apply_env_with(|k| m.get(k).cloned());
+            });
+            prop_assert!(res.is_ok(), "apply_env_with panicked on {:?}", m);
+        }
+
+        /// Numeric keys: a value that parses sets the field with no warning; a blank
+        /// value keeps the default silently; a non-empty non-parsing OR out-of-range
+        /// value keeps the default AND records exactly one warning.
+        #[test]
+        fn prop_numeric_keys_validate_and_warn(val in arb_value()) {
+            let d = Config::default();
+            for key in ["port", "localport", "channels", "connecttimeout", "accepttimeout"] {
+                let mut cfg = Config::default();
+                let mut m = HashMap::new();
+                m.insert(key.to_string(), val.clone());
+                cfg.apply_map(&m);
+
+                let t = val.trim();
+                // Unify u16/u32 fields as u32 for a single comparison.
+                let (got, def, parsed): (u32, u32, Option<u32>) = match key {
+                    "port" => (cfg.remote_port.into(), d.remote_port.into(), t.parse::<u16>().ok().map(Into::into)),
+                    "localport" => (cfg.local_port.into(), d.local_port.into(), t.parse::<u16>().ok().map(Into::into)),
+                    "channels" => (cfg.channels, d.channels, t.parse::<u32>().ok()),
+                    "connecttimeout" => (cfg.connect_timeout_ms, d.connect_timeout_ms, t.parse::<u32>().ok()),
+                    "accepttimeout" => (cfg.accept_timeout_ms, d.accept_timeout_ms, t.parse::<u32>().ok()),
+                    _ => unreachable!(),
+                };
+                if t.is_empty() {
+                    prop_assert_eq!(got, def, "blank {} should keep default", key);
+                    prop_assert!(cfg.warnings.is_empty(), "blank {} must not warn", key);
+                } else if let Some(p) = parsed {
+                    prop_assert_eq!(got, p, "valid {} not applied", key);
+                    prop_assert!(cfg.warnings.is_empty(), "valid {} warned", key);
+                } else {
+                    prop_assert_eq!(got, def, "invalid {} should keep default", key);
+                    prop_assert_eq!(cfg.warnings.len(), 1, "invalid {} must warn exactly once", key);
+                }
+            }
+        }
+
+        /// host: a non-blank value is stored verbatim with no warning (IP validity is
+        /// enforced later at Conn::connect); a blank/whitespace value keeps the
+        /// default AND warns.
+        #[test]
+        fn prop_host_stored_or_warns_on_blank(s in arb_value()) {
+            let d = Config::default();
+            let mut cfg = Config::default();
+            let mut m = HashMap::new();
+            m.insert("host".into(), s.clone());
+            cfg.apply_map(&m);
+            if s.trim().is_empty() {
+                prop_assert_eq!(&cfg.host, &d.host, "blank host must keep default");
+                prop_assert_eq!(cfg.warnings.len(), 1, "blank host must warn");
+            } else {
+                prop_assert_eq!(&cfg.host, &s, "non-blank host stored verbatim");
+                prop_assert!(cfg.warnings.is_empty(), "non-blank host must not warn");
+            }
+        }
+
+        /// Valid IPv4/IPv6 literals are accepted into the host (and would later be
+        /// usable); confirms both families parse through the layer.
+        #[test]
+        fn prop_valid_ip_host_accepted(ip in prop::sample::select(vec![
+            "127.0.0.1", "10.0.0.5", "192.168.1.250", "::1", "fe80::1", "2001:db8::dead:beef",
+        ])) {
+            let mut cfg = Config::default();
+            let mut m = HashMap::new();
+            m.insert("host".into(), ip.to_string());
+            cfg.apply_map(&m);
+            prop_assert_eq!(&cfg.host, ip);
+            prop_assert!(cfg.host.parse::<IpAddr>().is_ok(), "stored host must be a valid IP");
+            prop_assert!(cfg.warnings.is_empty());
+        }
+
+        /// allow-list: comma/whitespace-separated tokens parse into exactly the valid
+        /// IPs, in order; junk tokens are skipped (documented lenient behavior).
+        #[test]
+        fn prop_allow_list_parses_valid_skips_junk(
+            items in prop::collection::vec(
+                (arb_ip_token(), prop::sample::select(vec![",", " ", ", ", "\t", "  "])),
+                0..=10,
+            )
+        ) {
+            let mut s = String::new();
+            let mut want: Vec<IpAddr> = Vec::new();
+            for ((tok, ip), sep) in &items {
+                s.push_str(tok);
+                s.push_str(sep);
+                if let Some(ip) = ip {
+                    want.push(*ip);
+                }
+            }
+            let mut cfg = Config::default();
+            let mut m = HashMap::new();
+            m.insert("allow".into(), s.clone());
+            cfg.apply_map(&m);
+            prop_assert_eq!(cfg.allow, want, "allow-list mis-parsed {:?}", s);
+        }
+
+        /// Toggle mapping: proto t* -> tcp, tcprole s* -> server (case-insensitive on
+        /// the first byte), peercheck via the bool word-set. Compared to reference
+        /// implementations over arbitrary values.
+        #[test]
+        fn prop_toggles_map_correctly(s in arb_value()) {
+            let first_is = |c: u8| s.as_bytes().first().map(|b| b.to_ascii_lowercase() == c).unwrap_or(false);
+            let truthy = matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "enable" | "enabled"
+            );
+
+            let mut cfg = Config::default();
+            let mut m = HashMap::new();
+            m.insert("proto".into(), s.clone());
+            m.insert("tcprole".into(), s.clone());
+            m.insert("peercheck".into(), s.clone());
+            m.insert("udpportfallback".into(), s.clone());
+            cfg.apply_map(&m);
+            prop_assert_eq!(cfg.tcp, first_is(b't'), "proto mapping wrong for {:?}", s);
+            prop_assert_eq!(cfg.tcp_server, first_is(b's'), "tcprole mapping wrong for {:?}", s);
+            prop_assert_eq!(cfg.peer_check, truthy, "peercheck mapping wrong for {:?}", s);
+            prop_assert_eq!(cfg.udp_port_fallback, truthy, "udpportfallback mapping wrong for {:?}", s);
+        }
+
+        /// The env layer shares the same numeric validation as the INI layer: a
+        /// KVASILLONI_PORT that is blank/valid/invalid behaves identically.
+        #[test]
+        fn prop_env_numeric_validates_like_ini(val in arb_value()) {
+            let d = Config::default();
+            let mut cfg = Config::default();
+            let v = val.clone();
+            cfg.apply_env_with(|k| if k == "KVASILLONI_PORT" { Some(v.clone()) } else { None });
+            let t = val.trim();
+            if t.is_empty() {
+                prop_assert_eq!(cfg.remote_port, d.remote_port);
+                prop_assert!(cfg.warnings.is_empty());
+            } else if let Ok(p) = t.parse::<u16>() {
+                prop_assert_eq!(cfg.remote_port, p);
+                prop_assert!(cfg.warnings.is_empty());
+            } else {
+                prop_assert_eq!(cfg.remote_port, d.remote_port);
+                prop_assert_eq!(cfg.warnings.len(), 1);
+            }
+        }
     }
 }
