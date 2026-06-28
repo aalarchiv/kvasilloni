@@ -1540,4 +1540,108 @@ mod tests {
             ..Config::default()
         }
     }
+
+    // ===================== error-path leak audit (kvasilloni-lw6.4) =====================
+    // im6.5 covered the TCP write-error teardown; these cover the PARTIAL-OPEN failure
+    // paths - a connect that succeeds then fails the handshake, and a bind that fails -
+    // proving they strand no OS fd and no RX thread. The stress test checks the CONNS
+    // map; this checks the real OS resources via /proc/self. Linux-only (the host /
+    // selftest platform); the shipped DLL is unaffected.
+
+    #[cfg(target_os = "linux")]
+    fn count_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn count_threads() -> usize {
+        std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(0)
+    }
+
+    // /proc/self/fd and /proc/self/task are process-GLOBAL, so other tests running
+    // in parallel add (and remove) fds/threads during the measurement window. The
+    // discriminator: a genuine leak grows by ~1 per failed open (so ~N total), while
+    // that parallel-test noise is bounded and independent of N. So we only flag
+    // GROWTH (a thread/fd count can legitimately drop as a neighbour test finishes)
+    // and tolerate up to N/4 - far above realistic neighbour noise for this suite,
+    // far below the ~N a real per-iteration leak would produce.
+    #[cfg(target_os = "linux")]
+    fn assert_no_leak(label: &str, before: (usize, usize), after: (usize, usize), n: usize) {
+        let tol = n / 4;
+        assert!(
+            after.0 <= before.0 + tol,
+            "{label}: fd leak {} -> {} over {n} failed opens (tol {tol})",
+            before.0,
+            after.0
+        );
+        assert!(
+            after.1 <= before.1 + tol,
+            "{label}: thread leak {} -> {} over {n} failed opens (tol {tol})",
+            before.1,
+            after.1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_tcp_handshake_opens_leak_no_fd_or_thread() {
+        // A loopback server accepts then sends a WRONG 12-byte banner, so the client
+        // Conn::connect fails the handshake AFTER the socket is connected - the
+        // partial-open path. Many such failed opens must not grow the process fd or
+        // thread count: the connected socket (and handshake's clone) must be dropped,
+        // and the RX thread must never be spawned (handshake runs before the spawn).
+        const N: usize = 100;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            for _ in 0..N {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let mut buf = [0u8; 12];
+                    let _ = s.read_exact(&mut buf); // consume the client's banner
+                    let _ = s.write_all(b"NOPENOPENOPE"); // 12 bytes, wrong
+                }
+            }
+        });
+
+        let cfg = tcp_cfg(false, addr.port(), 0);
+        // Warm up once: the first connect lazily initialises thread-locals / the
+        // now_ms epoch / etc., which would otherwise look like a leak at the baseline.
+        assert!(Conn::connect(&cfg).is_err(), "wrong-banner handshake must fail");
+        std::thread::sleep(Duration::from_millis(30));
+
+        let before = (count_fds(), count_threads());
+        for _ in 0..(N - 1) {
+            assert!(Conn::connect(&cfg).is_err(), "wrong-banner handshake must fail");
+        }
+        std::thread::sleep(Duration::from_millis(60)); // let any transient fds close
+        let after = (count_fds(), count_threads());
+        srv.join().unwrap();
+
+        assert_no_leak("handshake-fail", before, after, N - 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_bind_opens_leak_no_fd_or_thread() {
+        // Occupy a port, then attempt a SERVER-role Conn::connect bound to it: the
+        // listener bind fails before anything is spawned. Many such failures must not
+        // leak a listener fd or a thread.
+        const N: usize = 100;
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let cfg = tcp_cfg(true, port, port); // server role, bind on the busy port
+
+        assert!(Conn::connect(&cfg).is_err(), "binding a busy port must fail"); // warm up
+        std::thread::sleep(Duration::from_millis(20));
+
+        let before = (count_fds(), count_threads());
+        for _ in 0..N {
+            let err = Conn::connect(&cfg).err().expect("binding a busy port must fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let after = (count_fds(), count_threads());
+
+        assert_no_leak("bind-fail", before, after, N);
+    }
 }
