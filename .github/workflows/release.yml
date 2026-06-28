@@ -44,6 +44,13 @@ jobs:
           cp README.md kvasilloni.ini.example COPYING COPYING.LESSER "dist/$pkg/"
           # README links into docs/*.md - ship them so the links resolve offline (kvasilloni-a8h)
           cp -r docs "dist/$pkg/docs"
+          # Ship the whole tools/ folder (ini_merge.py, which the README points
+          # users at to migrate a config, plus canbridge.py). Keep it one level
+          # below the example so ini_merge.py's default template auto-location
+          # resolves in the unzipped layout.
+          cp -r tools "dist/$pkg/tools"
+          # Never ship Python bytecode, even if some runner step produced any.
+          rm -rf "dist/$pkg/tools/__pycache__"
           (cd dist && zip -r "$pkg.zip" "$pkg")
           echo "== $pkg.zip =="
           unzip -l "dist/$pkg.zip"
@@ -90,6 +97,8 @@ jobs:
             | `kvasilloni-${{ github.ref_name }}-x64.zip` | 64-bit Windows apps |
 
             Each zip contains `canlib32.dll`, `README.md`, `kvasilloni.ini.example`,
-            the `docs/` folder, and the LGPL license texts (`COPYING`,
-            `COPYING.LESSER`). Drop `canlib32.dll` next to your application's
-            executable. Verify the download with `sha256sum -c SHA256SUMS.txt`.
+            the `docs/` folder, the `tools/` folder (incl. `ini_merge.py`, which
+            migrates an old config into the commented template; needs Python 3),
+            and the LGPL license texts (`COPYING`, `COPYING.LESSER`). Drop
+            `canlib32.dll` next to your application's executable. Verify the
+            download with `sha256sum -c SHA256SUMS.txt`.

@@ -48,6 +48,22 @@ KEY_LINE = re.compile(r"^(\s*)([;#]\s*)?([A-Za-z_]\w*)(\s*)=(\s*)(.*)$")
 INLINE_COMMENT = re.compile(r"\s*[;#].*$")
 
 
+def force_utf8_io() -> None:
+    """Make stdout/stderr UTF-8, matching the explicit utf-8 file I/O below.
+
+    On Windows the console and a redirected stdout default to the legacy ANSI
+    code page (e.g. cp1252), not UTF-8. Without this, a non-ASCII value in a
+    user's ini makes `sys.stdout.write`/error output raise UnicodeEncodeError,
+    and a redirected default-stdout run would write the file in cp1252 instead
+    of the UTF-8 that the `-o` path already produces. `reconfigure` is Python
+    3.7+; on 3.6 the streams are left as-is (and Windows users on 3.7+ get the
+    fix)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
+
+
 def warn(message: str) -> None:
     print(f"ini_merge: {message}", file=sys.stderr)
 
@@ -100,6 +116,7 @@ def merge(template: str, user: "dict[str, str]") -> str:
 
 
 def main() -> None:
+    force_utf8_io()
     here = os.path.dirname(os.path.abspath(__file__))
     default_template = os.path.normpath(os.path.join(here, "..", "kvasilloni.ini.example"))
 

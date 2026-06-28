@@ -7,6 +7,10 @@
 # reference projects, docs, etc that must not get into repo
 refs/
 
+# Python bytecode cache (e.g. from running tools/ini_merge.py)
+__pycache__/
+*.pyc
+
 # Rust / cargo build output
 /target/
 

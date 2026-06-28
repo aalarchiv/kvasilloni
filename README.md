@@ -115,8 +115,8 @@ without reopening the channel. A dropped link is observable: `canReadStatus` set
 > Upgrading from 0.2.0? Existing INI files keep working, but three defaults
 > changed: `peercheck` is now on, CAN FD receive needs `canOPEN_CAN_FD`, and a
 > busy UDP `localport` now fails the open (set `udpportfallback = on` for the old
-> behavior). `tools/ini_merge.py old.ini -o kvasilloni.ini` migrates a config into
-> the commented 0.3.0 template.
+> behavior). `tools/ini_merge.py old.ini -o kvasilloni.ini` (needs Python 3)
+> migrates a config into the commented 0.3.0 template.
 
 ## License
 
