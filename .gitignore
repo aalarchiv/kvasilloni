@@ -13,3 +13,12 @@ refs/
 # proptest failure-seed cache (kvasilloni-lw6). Re-derived on demand; a genuine
 # regression surfaces in the test output regardless, so we keep it out of the tree.
 proptest-regressions/
+
+# cargo-fuzz (kvasilloni-lw6.2): commit only the hand-crafted golden seeds
+# (seed_*); ignore build output, crash artifacts, the lockfile, and the
+# libFuzzer-discovered (hash-named) corpus growth.
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/Cargo.lock
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/seed_*

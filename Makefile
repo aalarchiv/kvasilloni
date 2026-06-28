@@ -5,6 +5,7 @@
 #   make dll64      build only the 64-bit DLL
 #   make test       run host unit tests (wire codec, golden vectors)
 #   make race       race-detect the transport concurrency under ThreadSanitizer
+#   make fuzz       coverage-guided fuzz the wire parser (parse_udp, ~60s each)
 #   make verify     confirm the exports are present and undecorated (32-bit)
 #   make selftest   end-to-end over vcan1 + cannelloni + wine (32-bit DLL)
 #   make selftest64 same end-to-end suite against the 64-bit DLL (wine wow64)
@@ -24,7 +25,7 @@ EXPORTS := canInitializeLibrary canOpenChannel canSetBusParams canBusOn canBusOf
            canIoCtl canAccept canObjBufSetFilter \
            canGetNumberOfChannels canGetChannelData canSetNotify
 
-.PHONY: all dll32 dll64 test race verify selftest selftest64 clean
+.PHONY: all dll32 dll64 test race fuzz verify selftest selftest64 clean
 
 all: dll32 dll64
 
@@ -48,6 +49,14 @@ race:
 	rustup component add rust-src --toolchain nightly
 	TSAN_OPTIONS="halt_on_error=1" RUSTFLAGS="-Zsanitizer=thread" \
 	    cargo +nightly test -Z build-std --target x86_64-unknown-linux-gnu --lib transport::
+
+# Coverage-guided fuzzing of the untrusted wire parsers under ASAN (kvasilloni-lw6.2).
+# Needs `cargo install cargo-fuzz` + the nightly toolchain. Seeds live in
+# fuzz/corpus/<target>/seed_*. Override the budget with FUZZ_SECS=N.
+FUZZ_SECS ?= 60
+fuzz:
+	cargo +nightly fuzz run parse_udp     -- -max_total_time=$(FUZZ_SECS)
+	cargo +nightly fuzz run decode_stream -- -max_total_time=$(FUZZ_SECS)
 
 verify: dll32
 	@echo "== 32-bit exports =="

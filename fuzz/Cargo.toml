@@ -1,0 +1,36 @@
+# Coverage-guided fuzzing of the untrusted wire parse surface (kvasilloni-lw6.2).
+# Separate crate (empty [workspace] detaches it from the parent package) so the
+# shipped canlib32.dll build is untouched - no fuzz/ASAN tooling leaks into it.
+#
+# The targets include the REAL src/wire.rs via #[path] rather than depending on the
+# parent crate: wire.rs is self-contained on std, and that keeps the parent a pure
+# cdylib (no added rlib crate-type just for fuzzing). The #[cfg(test)] block in
+# wire.rs (proptest) is inactive in a fuzz build, so nothing extra is pulled in.
+[package]
+name = "canlib32-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "parse_udp"
+path = "fuzz_targets/parse_udp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_stream"
+path = "fuzz_targets/decode_stream.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from any parent workspace so this builds as a standalone crate.
+[workspace]

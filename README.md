@@ -144,11 +144,25 @@ rustup target add i686-pc-windows-gnu x86_64-pc-windows-gnu
 
 make            # -> target/{i686,x86_64}-pc-windows-gnu/release/canlib32.dll
 make verify     # confirm all exports are present and undecorated (32-bit)
-make test       # host unit tests for the wire codec (golden vectors + round-trips)
+make test       # host unit tests + property tests (wire codec, transport, config)
 ```
 
 Build a single bitness with `make dll32` or `make dll64`. Pick the DLL that
 matches your Windows application's bitness (most legacy Kvaser apps are 32-bit).
+
+### Robustness checks (optional; need a nightly toolchain)
+
+```bash
+make race       # race-detect the transport concurrency under ThreadSanitizer
+make fuzz       # coverage-guided fuzz the untrusted wire parsers under ASAN
+                #   (cargo install cargo-fuzz first; FUZZ_SECS=N sets the budget)
+```
+
+`make race` rebuilds std with TSan instrumentation (`-Z build-std`) and treats any
+data race as a hard failure; `make fuzz` exercises `parse_udp` and `decode_stream`
+against arbitrary bytes, seeded from `fuzz/corpus/<target>/seed_*`. Both back the
+`cargo test` property suites and are documented further in `src/transport.rs` and
+`fuzz/`.
 
 ## Deploy (Windows side)
 
