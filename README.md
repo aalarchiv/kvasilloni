@@ -1,8 +1,8 @@
 # kvasilloni
 
 A drop-in replacement for Kvaser's **`canlib32.dll`** that bridges a Windows CAN
-application to a **Linux `vcan`** over the network using
-[cannelloni](https://github.com/mguentner/cannelloni) - no Kvaser hardware, no
+application to a **Linux `vcan`** over the network using [cannellonis](https://github.com/aalarchiv/cannellonis) (multi-peer
+[cannelloni](https://github.com/mguentner/cannelloni) CAN proxy) - no Kvaser hardware, no
 kernel driver.
 
 The intended use case: CAN software running in a **Windows 11 VM** (that drives
